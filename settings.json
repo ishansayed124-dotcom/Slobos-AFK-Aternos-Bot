@@ -27,10 +27,15 @@
       "sneak": true
     },
     "chat-messages": {
-      "enabled": false,
-      "repeat": false,
-      "repeat-delay": 120,
-      "messages": []
+      "enabled": true,
+      "repeat": true,
+      "repeat-delay": 600,
+      "messages": [
+        "Mining away...",
+        "Checking out the base area.",
+        "This world looks great.",
+        "Just working on some stuff."
+      ]
     },
     "chat-log": false,
     "auto-reconnect": true,
@@ -41,16 +46,16 @@
     "enabled": true,
     "circle-walk": {
       "enabled": true,
-      "radius": 1,
-      "speed": 1000
+      "radius": 2,
+      "speed": 1500
     },
     "look-around": {
       "enabled": true,
-      "interval": 3000
+      "interval": 4000
     },
     "random-jump": {
       "enabled": true,
-      "interval": 15000
+      "interval": 20000
     }
   },
   "modules": {
