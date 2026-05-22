@@ -8,6 +8,7 @@ const config = require("./settings.json");
 const express = require("express");
 const http = require("http");
 const https = require("https");
+const setupLeaveRejoin = require("./leaveRejoin");
 
 // ============================================================
 // EXPRESS SERVER - Keep Render/Aternos alive
@@ -24,6 +25,7 @@ let botState = {
   startTime: Date.now(),
   errors: [],
   wasThrottled: false,
+  forcedReconnectDelayMs: null,
 };
 
 // Health check endpoint for monitoring
@@ -1164,6 +1166,13 @@ function addInterval(callback, delay) {
 }
 
 function getReconnectDelay() {
+  if (botState.forcedReconnectDelayMs != null) {
+    const forced = Math.max(0, Number(botState.forcedReconnectDelayMs));
+    botState.forcedReconnectDelayMs = null; // one-shot
+    botState.reconnectAttempts = 0; // avoid exponential backoff after an intentional leave
+    return forced;
+  }
+
   if (botState.wasThrottled) {
     botState.wasThrottled = false;
     const throttleDelay = 60000 + Math.floor(Math.random() * 60000);
@@ -1224,6 +1233,22 @@ function createBot() {
     });
 
     bot.loadPlugin(pathfinder);
+
+    // Optional "human-like" leave/rejoin sessions (index.js still owns reconnect logic).
+    if (config.utils && config.utils["leave-rejoin"] && config.utils["leave-rejoin"].enabled) {
+      const lr = config.utils["leave-rejoin"];
+      setupLeaveRejoin(bot, {
+        onlineMinMs: Number(lr["online-min-seconds"] ?? 1800) * 1000,
+        onlineMaxMs: Number(lr["online-max-seconds"] ?? 5400) * 1000,
+        offlineMs: Number(lr["offline-seconds"] ?? 180) * 1000,
+        setNextReconnectDelayMs: (ms) => {
+          botState.forcedReconnectDelayMs = ms;
+        },
+      });
+      addLog(
+        `[AFK] Leave/Rejoin enabled (offline=${Number(lr["offline-seconds"] ?? 180)}s)`,
+      );
+    }
 
     // FIX: connection timeout - end the old bot before reconnecting to avoid ghost bots
     clearBotTimeouts();
@@ -1463,6 +1488,73 @@ function initializeModules(bot, mcData, defaultMove) {
         }, idx * 1000);
       });
     }
+  }
+
+  // ---------- CREATIVE "EAT GOLDEN APPLE" ----------
+  if (config.utils["creative-eat"] && config.utils["creative-eat"].enabled) {
+    const ce = config.utils["creative-eat"];
+    const chance = Number.isFinite(Number(ce.chance)) ? Number(ce.chance) : 0.25;
+    const minDelaySec = Number(ce["min-delay-seconds"] ?? 240);
+    const maxDelaySec = Number(ce["max-delay-seconds"] ?? 720);
+    const autoGive = !!ce["auto-give-if-missing"];
+
+    const randomMs = (minMs, maxMs) =>
+      Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+
+    const isCreative = () => {
+      const gm = bot?.game?.gameMode ?? bot?.game?.mode;
+      if (gm == null) return false;
+      if (typeof gm === "string") return gm.toLowerCase() === "creative";
+      return gm === 1; // mineflayer commonly uses 0/1/2/3
+    };
+
+    const scheduleNextEat = () => {
+      const minMs = Math.max(10_000, minDelaySec * 1000);
+      const maxMs = Math.max(minMs, maxDelaySec * 1000);
+      return Date.now() + randomMs(minMs, maxMs);
+    };
+
+    let nextEatAt = Date.now() + randomMs(60_000, 180_000); // start 1-3 min after spawn
+
+    addInterval(() => {
+      if (!bot || !botState.connected) return;
+      if (!isCreative()) return;
+      if (Date.now() < nextEatAt) return;
+
+      nextEatAt = scheduleNextEat();
+
+      if (Math.random() > chance) return;
+
+      const goldenApple = bot.inventory
+        ?.items()
+        ?.find((item) => item?.name === "golden_apple");
+
+      if (!goldenApple) {
+        addLog("[CreativeEat] No golden apple in inventory.");
+        if (autoGive) {
+          addLog("[CreativeEat] Trying /give (requires OP).");
+          bot.chat("/give @s golden_apple 1");
+        }
+        return;
+      }
+
+      bot.equip(goldenApple, "hand")
+        .then(() => bot.consume())
+        .then(() => {
+          botState.lastActivity = Date.now();
+          addLog("[CreativeEat] Ate a golden apple (creative).");
+          setTimeout(() => {
+            try {
+              bot.setQuickBarSlot(0);
+            } catch (e) {
+              /* ignore */
+            }
+          }, 2500);
+        })
+        .catch((err) => {
+          addLog(`[CreativeEat] Failed: ${err?.message || err}`);
+        });
+    }, 10_000);
   }
 
   // ---------- MOVE TO POSITION ----------

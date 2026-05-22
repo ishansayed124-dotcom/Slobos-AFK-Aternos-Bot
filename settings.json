@@ -38,6 +38,19 @@
       ]
     },
     "chat-log": false,
+    "leave-rejoin": {
+      "enabled": false,
+      "online-min-seconds": 1800,
+      "online-max-seconds": 5400,
+      "offline-seconds": 180
+    },
+    "creative-eat": {
+      "enabled": false,
+      "chance": 0.25,
+      "min-delay-seconds": 240,
+      "max-delay-seconds": 720,
+      "auto-give-if-missing": false
+    },
     "auto-reconnect": true,
     "auto-reconnect-delay": 5000,
     "max-reconnect-delay": 120000
