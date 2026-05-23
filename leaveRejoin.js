@@ -58,7 +58,7 @@ function setupLeaveRejoin(bot, options = {}) {
 
         logThrottled(`[AFK] Will leave in ${Math.round(stayTime / 1000)} seconds`)
 
-        scheduleNextJump()
+        if (!options.disableJumps) scheduleNextJump()
 
         leaveTimer = setTimeout(() => {
             if (stopped) return

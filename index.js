@@ -26,6 +26,7 @@ let botState = {
   errors: [],
   wasThrottled: false,
   forcedReconnectDelayMs: null,
+  reconnectBlockedReason: null,
 };
 
 // Health check endpoint for monitoring
@@ -981,6 +982,7 @@ app.post("/start", (req, res) => {
   if (botRunning) return res.json({ success: false, msg: "Already running" });
 
   botRunning = true;
+  botState.reconnectBlockedReason = null;
   createBot();
   addLog("[Control] Bot started");
 
@@ -1133,10 +1135,84 @@ setInterval(
 // RECONNECTION & TIMEOUT MANAGEMENT
 // ============================================================
 let bot = null;
+let maintenanceBot = null;
+let maintenanceStopTimer = null;
 let activeIntervals = [];
 let reconnectTimeoutId = null;
 let connectionTimeoutId = null;
 let isReconnecting = false;
+
+function stopMaintenanceBot(reason = "main bot connected") {
+  if (maintenanceStopTimer) {
+    clearTimeout(maintenanceStopTimer);
+    maintenanceStopTimer = null;
+  }
+  if (!maintenanceBot) return;
+  try {
+    addLog(`[Maintenance] Stopping (${reason})`);
+    maintenanceBot.removeAllListeners();
+    maintenanceBot.end();
+  } catch (e) {
+    /* ignore */
+  } finally {
+    maintenanceBot = null;
+  }
+}
+
+function startMaintenanceBot(maxAliveMs) {
+  const mb = config.utils?.["maintenance-bot"];
+  if (!mb || !mb.enabled) return;
+  if (maintenanceBot) return;
+
+  const username = String(mb.username || "Mantanence");
+  addLog(`[Maintenance] Starting as ${username}`);
+
+  try {
+    const botVersion =
+      config.server.version && config.server.version.trim() !== ""
+        ? config.server.version
+        : false;
+
+    maintenanceBot = mineflayer.createBot({
+      username,
+      auth: config["bot-account"].type,
+      host: config.server.ip,
+      port: config.server.port,
+      version: botVersion,
+      hideErrors: true,
+      checkTimeoutInterval: 600000,
+    });
+
+    maintenanceBot.once("spawn", () => {
+      // Minimal anti-idle: hold sneak (silent).
+      try {
+        maintenanceBot.setControlState?.("sneak", true);
+      } catch (e) {
+        /* ignore */
+      }
+    });
+
+    maintenanceBot.on("end", () => {
+      maintenanceBot = null;
+    });
+    maintenanceBot.on("kicked", () => {
+      // Don't loop-reconnect; main bot will handle overall uptime.
+      stopMaintenanceBot("kicked");
+    });
+    maintenanceBot.on("error", () => {
+      stopMaintenanceBot("error");
+    });
+
+    if (Number.isFinite(Number(maxAliveMs)) && Number(maxAliveMs) > 0) {
+      maintenanceStopTimer = setTimeout(() => {
+        stopMaintenanceBot("cooldown finished");
+      }, Number(maxAliveMs));
+    }
+  } catch (e) {
+    addLog(`[Maintenance] Failed to start: ${e.message}`);
+    maintenanceBot = null;
+  }
+}
 
 function clearBotTimeouts() {
   if (reconnectTimeoutId) {
@@ -1237,10 +1313,16 @@ function createBot() {
     // Optional "human-like" leave/rejoin sessions (index.js still owns reconnect logic).
     if (config.utils && config.utils["leave-rejoin"] && config.utils["leave-rejoin"].enabled) {
       const lr = config.utils["leave-rejoin"];
+      const randomFlyEnabled = !!(
+        config.movement &&
+        config.movement["random-fly"] &&
+        config.movement["random-fly"].enabled
+      );
       setupLeaveRejoin(bot, {
         onlineMinMs: Number(lr["online-min-seconds"] ?? 1800) * 1000,
         onlineMaxMs: Number(lr["online-max-seconds"] ?? 5400) * 1000,
         offlineMs: Number(lr["offline-seconds"] ?? 180) * 1000,
+        disableJumps: randomFlyEnabled,
         setNextReconnectDelayMs: (ms) => {
           botState.forcedReconnectDelayMs = ms;
         },
@@ -1278,6 +1360,8 @@ function createBot() {
       botState.lastActivity = Date.now();
       botState.reconnectAttempts = 0;
       isReconnecting = false;
+
+      stopMaintenanceBot();
 
       addLog(
         `[Bot] [+] Successfully spawned on server! (Version: ${bot.version})`,
@@ -1349,6 +1433,28 @@ function createBot() {
       }
 
       if (
+        reasonStr.includes("connected for") ||
+        reasonStr.includes("playtime") ||
+        reasonStr.includes("too long") ||
+        reasonStr.includes("session")
+      ) {
+        const cooloff = 120000 + Math.floor(Math.random() * 180000); // 2-5 min
+        botState.forcedReconnectDelayMs = cooloff;
+        addLog("[Kick] Long-session kick detected");
+        startMaintenanceBot(cooloff + 60000);
+      }
+
+      if (
+        reasonStr.includes("you are banned") ||
+        reasonStr.includes("banned from this server") ||
+        reasonStr.includes("violates our terms of service")
+      ) {
+        botState.reconnectBlockedReason = kickReason;
+        botRunning = false;
+        addLog("[Bot] Reconnect disabled because the account is banned.");
+      }
+
+      if (
         config.discord &&
         config.discord.events &&
         config.discord.events.disconnect
@@ -1395,6 +1501,16 @@ function createBot() {
 function scheduleReconnect() {
   clearBotTimeouts();
 
+  if (!botRunning) {
+    addLog("[Bot] Reconnect skipped because bot is stopped.");
+    return;
+  }
+
+  if (botState.reconnectBlockedReason) {
+    addLog(`[Bot] Reconnect blocked: ${botState.reconnectBlockedReason}`);
+    return;
+  }
+
   // FIX: don't stack reconnect if already waiting
   if (isReconnecting) {
     addLog("[Bot] Reconnect already scheduled, skipping duplicate.");
@@ -1421,6 +1537,11 @@ function scheduleReconnect() {
 // ============================================================
 function initializeModules(bot, mcData, defaultMove) {
   addLog("[Modules] Initializing all modules...");
+  const randomFlyEnabled = !!(
+    config.movement &&
+    config.movement["random-fly"] &&
+    config.movement["random-fly"].enabled
+  );
 
   // ---------- AUTO AUTH (REACTIVE) ----------
   if (config.utils["auto-auth"] && config.utils["auto-auth"].enabled) {
@@ -1514,7 +1635,9 @@ function initializeModules(bot, mcData, defaultMove) {
       return Date.now() + randomMs(minMs, maxMs);
     };
 
-    let nextEatAt = Date.now() + randomMs(60_000, 180_000); // start 1-3 min after spawn
+    const minMs = Math.max(10_000, minDelaySec * 1000);
+    const maxMs = Math.max(minMs, maxDelaySec * 1000);
+    let nextEatAt = Date.now() + randomMs(minMs, maxMs);
 
     addInterval(() => {
       if (!bot || !botState.connected) return;
@@ -1562,6 +1685,7 @@ function initializeModules(bot, mcData, defaultMove) {
   if (
     config.position &&
     config.position.enabled &&
+    !randomFlyEnabled &&
     !(
       config.movement &&
       config.movement["circle-walk"] &&
@@ -1677,6 +1801,10 @@ function initializeModules(bot, mcData, defaultMove) {
   // ---------- MOVEMENT MODULES ----------
   // FIX: check top-level movement.enabled flag
   if (config.movement && config.movement.enabled !== false) {
+    if (randomFlyEnabled) {
+      startRandomFly(bot);
+      // Don't start ground/pathfinder movement modules while flying.
+    } else {
     // FIX: circle-walk and random-jump both jump - only run one jumping mechanism
     // random-jump is skipped if anti-afk jump is handled elsewhere; we only use random-jump here
     if (
@@ -1700,6 +1828,7 @@ function initializeModules(bot, mcData, defaultMove) {
       config.movement["look-around"].enabled
     ) {
       startLookAround(bot);
+    }
     }
   }
 
@@ -1775,17 +1904,110 @@ function startRandomJump(bot) {
 }
 
 function startLookAround(bot) {
-  addInterval(() => {
+  const la = config.movement["look-around"] || {};
+  const minMs = Math.max(250, Number(la["min-interval-ms"] ?? la.interval ?? 4000));
+  const maxMs = Math.max(minMs, Number(la["max-interval-ms"] ?? la.interval ?? 4000));
+  const randomMs = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
+
+  const loop = () => {
     if (!bot || !botState.connected) return;
     try {
-      const yaw = Math.random() * Math.PI * 2 - Math.PI;
-      const pitch = (Math.random() * Math.PI) / 2 - Math.PI / 4;
+      // yaw: 0..360deg, pitch: -0.5..0.5
+      const yaw = Math.random() * Math.PI * 2;
+      const pitch = Math.random() - 0.5;
       bot.look(yaw, pitch, false);
       botState.lastActivity = Date.now();
     } catch (e) {
       addLog("[LookAround] Error:", e.message);
+    } finally {
+      setTimeout(loop, randomMs(minMs, maxMs));
     }
-  }, config.movement["look-around"].interval);
+  };
+
+  setTimeout(loop, randomMs(minMs, maxMs));
+}
+
+function startRandomFly(bot) {
+  const rf = config.movement["random-fly"] || {};
+  const intervalMs = Math.max(1000, Number(rf["interval-ms"] ?? 600000));
+  const durationMs = Math.max(250, Number(rf["duration-ms"] ?? 30000));
+  const rangeXZ = Math.max(1, Number(rf["range-xz"] ?? 150));
+  const minY = Number(rf["min-y"] ?? 150);
+  const maxY = Math.max(minY, Number(rf["max-y"] ?? 250));
+  const useCreativeFlyTo = rf["use-creative-flyto"] !== false;
+
+  const randomMs = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
+  const randomInt = (a, b) => Math.floor(a + Math.random() * (b - a + 1));
+
+  let inFlight = false;
+  let flightSessionTimer = null;
+
+  const loop = () => {
+    if (!bot || !botState.connected || !bot.entity) return;
+    if (inFlight) return;
+
+    const safe = {
+      x: Number.isFinite(Number(rf["safe-x"])) ? Number(rf["safe-x"]) : (config.position?.x ?? bot.entity.position.x),
+      y: Number.isFinite(Number(rf["safe-y"])) ? Number(rf["safe-y"]) : (config.position?.y ?? bot.entity.position.y),
+      z: Number.isFinite(Number(rf["safe-z"])) ? Number(rf["safe-z"]) : (config.position?.z ?? bot.entity.position.z),
+    };
+
+    const dx = randomInt(-rangeXZ, rangeXZ);
+    const dz = randomInt(-rangeXZ, rangeXZ);
+    const targetY = randomInt(minY, maxY);
+    const destination = bot.entity.position.offset(
+      safe.x + dx - bot.entity.position.x,
+      targetY - bot.entity.position.y,
+      safe.z + dz - bot.entity.position.z,
+    );
+
+    inFlight = true;
+    if (flightSessionTimer) clearTimeout(flightSessionTimer);
+    flightSessionTimer = setTimeout(() => {
+      try {
+        // Ensure we don't keep "jump" stuck if fallback mode was used.
+        bot.setControlState?.("jump", false);
+      } catch (e) {
+        /* ignore */
+      } finally {
+        inFlight = false;
+      }
+    }, durationMs);
+
+    try {
+      bot.pathfinder?.setGoal(null);
+    } catch (e) {
+      /* ignore */
+    }
+
+    if (useCreativeFlyTo && bot.creative && typeof bot.creative.flyTo === "function") {
+      Promise.resolve(bot.creative.flyTo(destination))
+        .catch((e) => addLog("[RandomFly] flyTo error:", e?.message ?? String(e)))
+        .finally(() => {
+          botState.lastActivity = Date.now();
+          setTimeout(loop, intervalMs);
+        });
+      return;
+    }
+
+    // Fallback: try to go "up" for duration (works only if server allows flight).
+    if (typeof bot.setControlState === "function") {
+      bot.setControlState("jump", true);
+      setTimeout(() => {
+        try {
+          if (bot && typeof bot.setControlState === "function") bot.setControlState("jump", false);
+        } finally {
+          botState.lastActivity = Date.now();
+          setTimeout(loop, intervalMs);
+        }
+      }, durationMs);
+    } else {
+      inFlight = false;
+      setTimeout(loop, intervalMs);
+    }
+  };
+
+  setTimeout(loop, randomMs(5000, 15000)); // start 5-15s after spawn
 }
 
 // ============================================================

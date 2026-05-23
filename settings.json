@@ -27,7 +27,7 @@
       "sneak": true
     },
     "chat-messages": {
-      "enabled": true,
+      "enabled": false,
       "repeat": true,
       "repeat-delay": 600,
       "messages": [
@@ -39,24 +39,40 @@
     },
     "chat-log": false,
     "leave-rejoin": {
-      "enabled": false,
-      "online-min-seconds": 1800,
-      "online-max-seconds": 5400,
+      "enabled": true,
+      "online-min-seconds": 14400,
+      "online-max-seconds": 21600,
       "offline-seconds": 180
     },
     "creative-eat": {
-      "enabled": false,
-      "chance": 0.25,
-      "min-delay-seconds": 240,
-      "max-delay-seconds": 720,
+      "enabled": true,
+      "chance": 1,
+      "min-delay-seconds": 45,
+      "max-delay-seconds": 120,
       "auto-give-if-missing": false
     },
     "auto-reconnect": true,
     "auto-reconnect-delay": 5000,
-    "max-reconnect-delay": 120000
+    "max-reconnect-delay": 120000,
+    "maintenance-bot": {
+      "enabled": true,
+      "username": "Mantanence"
+    }
   },
   "movement": {
     "enabled": true,
+    "random-fly": {
+      "enabled": true,
+      "interval-ms": 600000,
+      "duration-ms": 30000,
+      "safe-x": 0,
+      "safe-y": 150,
+      "safe-z": 0,
+      "range-xz": 150,
+      "min-y": 150,
+      "max-y": 250,
+      "use-creative-flyto": true
+    },
     "circle-walk": {
       "enabled": true,
       "radius": 2,
@@ -64,7 +80,8 @@
     },
     "look-around": {
       "enabled": true,
-      "interval": 4000
+      "min-interval-ms": 3000,
+      "max-interval-ms": 7000
     },
     "random-jump": {
       "enabled": true,
