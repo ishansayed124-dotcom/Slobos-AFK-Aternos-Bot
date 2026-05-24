@@ -13,8 +13,10 @@
   },
   "position": {
     "enabled": true,
+    "teleport-on-join": true,
+    "silent": true,
     "x": 0,
-    "y": 100,
+    "y": 80,
     "z": 0
   },
   "utils": {
@@ -63,6 +65,7 @@
     "enabled": true,
     "random-fly": {
       "enabled": true,
+      "mode": "pattern",
       "interval-ms": 600000,
       "duration-ms": 30000,
       "safe-x": 0,
@@ -71,7 +74,11 @@
       "range-xz": 150,
       "min-y": 150,
       "max-y": 250,
-      "use-creative-flyto": true
+      "use-creative-flyto": true,
+      "pattern-forward-ms": 10000,
+      "pattern-up-ms": 1000,
+      "pattern-wait-ms": 600000,
+      "pattern-down-ms": 10000
     },
     "circle-walk": {
       "enabled": true,

@@ -2,6 +2,10 @@ function randomMs(minMs, maxMs) {
     return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs
 }
 
+function isPromiseLike(value) {
+    return !!value && (typeof value === 'object' || typeof value === 'function') && typeof value.then === 'function'
+}
+
 function setupLeaveRejoin(bot, options = {}) {
     // Timers
     let leaveTimer = null
@@ -53,6 +57,9 @@ function setupLeaveRejoin(bot, options = {}) {
             typeof options.setNextReconnectDelayMs === 'function'
                 ? options.setNextReconnectDelayMs
                 : null
+        const onBeforeLeave =
+            typeof options.onBeforeLeave === 'function' ? options.onBeforeLeave : null
+        const beforeLeaveTimeoutMs = Math.max(0, Number(options.beforeLeaveTimeoutMs ?? 20000))
 
         const stayTime = randomMs(onlineMinMs, onlineMaxMs)
 
@@ -60,12 +67,40 @@ function setupLeaveRejoin(bot, options = {}) {
 
         if (!options.disableJumps) scheduleNextJump()
 
-        leaveTimer = setTimeout(() => {
+        function scheduleLeaveIn(ms) {
+            if (leaveTimer) clearTimeout(leaveTimer)
+            leaveTimer = setTimeout(attemptLeave, ms)
+        }
+
+        async function attemptLeave() {
             if (stopped) return
             logThrottled('[AFK] Leaving server (timer)')
             if (setNextReconnectDelayMs) {
                 setNextReconnectDelayMs(offlineMs)
                 logThrottled(`[AFK] Next rejoin forced to ${Math.round(offlineMs / 1000)} seconds`)
+            }
+            // Optional: keep the server alive during the offline window (e.g., by starting a maintenance bot)
+            if (onBeforeLeave) {
+                try {
+                    const result = onBeforeLeave({ offlineMs })
+                    if (isPromiseLike(result)) {
+                        const timed = new Promise((resolve) =>
+                            setTimeout(() => resolve('__timeout__'), beforeLeaveTimeoutMs),
+                        )
+                        const r = await Promise.race([result, timed])
+                        if (r === '__timeout__') {
+                            logThrottled(`[AFK] onBeforeLeave timed out after ${Math.round(beforeLeaveTimeoutMs / 1000)}s`)
+                        } else if (r === false) {
+                            logThrottled('[AFK] onBeforeLeave reported failure; skipping leave to avoid empty server')
+                            const retryMs = randomMs(5 * 60 * 1000, 15 * 60 * 1000)
+                            logThrottled(`[AFK] Retrying leave in ${Math.round(retryMs / 1000)} seconds`)
+                            scheduleLeaveIn(retryMs)
+                            return
+                        }
+                    }
+                } catch (e) {
+                    // don't block leaving if the hook fails
+                }
             }
             cleanup()
             try {
@@ -73,7 +108,9 @@ function setupLeaveRejoin(bot, options = {}) {
             } catch (e) {
                 // ignore if already closed
             }
-        }, stayTime)
+        }
+
+        scheduleLeaveIn(stayTime)
     })
 
     // When the connection ends for ANY reason, just clean up our timers.

@@ -1094,17 +1094,17 @@ function formatUptime(seconds) {
 const SELF_PING_INTERVAL = 10 * 60 * 1000;
 
 function startSelfPing() {
-  const renderUrl = process.env.RENDER_EXTERNAL_URL;
-  if (!renderUrl) {
+  const pingUrl = process.env.RENDER_EXTERNAL_URL || process.env.SELF_PING_URL;
+  if (!pingUrl) {
     addLog(
-      "[KeepAlive] No RENDER_EXTERNAL_URL set - self-ping disabled (running locally)",
+      "[KeepAlive] No RENDER_EXTERNAL_URL/SELF_PING_URL set - self-ping disabled",
     );
     return;
   }
   setInterval(() => {
-    const protocol = renderUrl.startsWith("https") ? https : http;
+    const protocol = pingUrl.startsWith("https") ? https : http;
     protocol
-      .get(`${renderUrl}/ping`, (res) => {
+      .get(`${pingUrl}/ping`, (res) => {
         // Silent success
       })
       .on("error", (err) => {
@@ -1159,19 +1159,38 @@ function stopMaintenanceBot(reason = "main bot connected") {
   }
 }
 
-function startMaintenanceBot(maxAliveMs) {
+function startMaintenanceBot(maxAliveMs, options = {}) {
   const mb = config.utils?.["maintenance-bot"];
-  if (!mb || !mb.enabled) return;
-  if (maintenanceBot) return;
+  if (!mb || !mb.enabled) return Promise.resolve(false);
+  if (maintenanceBot) return Promise.resolve(true);
 
   const username = String(mb.username || "Mantanence");
   addLog(`[Maintenance] Starting as ${username}`);
+
+  const connectTimeoutMs = Math.max(
+    5000,
+    Number(options.connectTimeoutMs ?? 25000),
+  );
 
   try {
     const botVersion =
       config.server.version && config.server.version.trim() !== ""
         ? config.server.version
         : false;
+
+    let spawned = false;
+    let resolved = false;
+    let connectTimer = null;
+
+    const done = (ok) => {
+      if (resolved) return;
+      resolved = true;
+      if (connectTimer) {
+        clearTimeout(connectTimer);
+        connectTimer = null;
+      }
+      return ok;
+    };
 
     maintenanceBot = mineflayer.createBot({
       username,
@@ -1184,15 +1203,26 @@ function startMaintenanceBot(maxAliveMs) {
     });
 
     maintenanceBot.once("spawn", () => {
+      spawned = true;
       // Minimal anti-idle: hold sneak (silent).
       try {
         maintenanceBot.setControlState?.("sneak", true);
       } catch (e) {
         /* ignore */
       }
+      if (typeof options.onSpawn === "function") {
+        try {
+          options.onSpawn();
+        } catch (e) {
+          /* ignore */
+        }
+      }
     });
 
     maintenanceBot.on("end", () => {
+      if (!spawned) {
+        addLog("[Maintenance] Disconnected before spawn");
+      }
       maintenanceBot = null;
     });
     maintenanceBot.on("kicked", () => {
@@ -1208,9 +1238,33 @@ function startMaintenanceBot(maxAliveMs) {
         stopMaintenanceBot("cooldown finished");
       }, Number(maxAliveMs));
     }
+
+    // Return a promise that resolves once we have spawned (or timed out).
+    return new Promise((resolve) => {
+      connectTimer = setTimeout(() => {
+        if (!spawned) {
+          addLog(
+            `[Maintenance] Spawn timeout after ${Math.round(
+              connectTimeoutMs / 1000,
+            )}s`,
+          );
+          try {
+            stopMaintenanceBot("spawn timeout");
+          } catch (_) {}
+          resolve(done(false));
+          return;
+        }
+        resolve(done(true));
+      }, connectTimeoutMs);
+
+      maintenanceBot.once("spawn", () => {
+        resolve(done(true));
+      });
+    });
   } catch (e) {
     addLog(`[Maintenance] Failed to start: ${e.message}`);
     maintenanceBot = null;
+    return Promise.resolve(false);
   }
 }
 
@@ -1326,6 +1380,14 @@ function createBot() {
         setNextReconnectDelayMs: (ms) => {
           botState.forcedReconnectDelayMs = ms;
         },
+        onBeforeLeave: ({ offlineMs }) => {
+          // Aternos pauses/stops quickly when the server is empty.
+          // Keep one lightweight "maintenance" connection online during the offline window.
+          return startMaintenanceBot(Number(offlineMs) + 60000, {
+            connectTimeoutMs: 25000,
+          });
+        },
+        beforeLeaveTimeoutMs: 25000,
       });
       addLog(
         `[AFK] Leave/Rejoin enabled (offline=${Number(lr["offline-seconds"] ?? 180)}s)`,
@@ -1421,6 +1483,24 @@ function createBot() {
       clearAllIntervals();
 
       const reasonStr = String(kickReason).toLowerCase();
+      // Duplicate-login kicks can happen if:
+      // - The account is still connected from a previous session, or
+      // - A reconnect happens before the server fully releases the old connection.
+      // Give the server time to drop the old session before attempting to rejoin.
+      if (
+        reasonStr.includes("duplicate_login") ||
+        reasonStr.includes("duplicate login") ||
+        reasonStr.includes("already logged") ||
+        reasonStr.includes("already connected")
+      ) {
+        const cooloff = 30000 + Math.floor(Math.random() * 30000); // 30-60s
+        botState.forcedReconnectDelayMs = cooloff;
+        addLog(
+          `[Kick] Duplicate-login detected - delaying reconnect for ${Math.round(
+            cooloff / 1000,
+          )}s`,
+        );
+      }
       if (
         reasonStr.includes("throttl") ||
         reasonStr.includes("wait before reconnect") ||
@@ -1542,6 +1622,30 @@ function initializeModules(bot, mcData, defaultMove) {
     config.movement["random-fly"] &&
     config.movement["random-fly"].enabled
   );
+
+  // ---------- TELEPORT TO POSITION (SILENT) ----------
+  // If enabled, teleport on join (useful for sky platforms). This intentionally does not log.
+  if (config.position?.enabled && config.position["teleport-on-join"]) {
+    const silent = config.position?.silent !== false;
+    const tx = Number(config.position.x ?? 0);
+    const ty = Number(config.position.y ?? 80);
+    const tz = Number(config.position.z ?? 0);
+
+    // Delay so /login (if any) can complete before issuing /tp.
+    setTimeout(() => {
+      if (!bot || !botState.connected) return;
+      try {
+        bot.chat(`/tp @s ${tx} ${ty} ${tz}`);
+
+        // Optional: request creative mode (requires OP). Kept silent.
+        if (config.server?.["try-creative"]) {
+          bot.chat("/gamemode creative");
+        }
+      } catch (e) {
+        if (!silent) addLog(`[Position] Teleport failed: ${e?.message || e}`);
+      }
+    }, 12000);
+  }
 
   // ---------- AUTO AUTH (REACTIVE) ----------
   if (config.utils["auto-auth"] && config.utils["auto-auth"].enabled) {
@@ -1685,6 +1789,7 @@ function initializeModules(bot, mcData, defaultMove) {
   if (
     config.position &&
     config.position.enabled &&
+    !config.position["teleport-on-join"] &&
     !randomFlyEnabled &&
     !(
       config.movement &&
@@ -1929,6 +2034,12 @@ function startLookAround(bot) {
 
 function startRandomFly(bot) {
   const rf = config.movement["random-fly"] || {};
+  // Optional pattern mode:
+  // Fly forward 10s -> change camera -> up 1s -> wait 10min -> down 10s -> repeat
+  if (String(rf.mode || "").toLowerCase() === "pattern") {
+    startPatternFly(bot, rf);
+    return;
+  }
   const intervalMs = Math.max(1000, Number(rf["interval-ms"] ?? 600000));
   const durationMs = Math.max(250, Number(rf["duration-ms"] ?? 30000));
   const rangeXZ = Math.max(1, Number(rf["range-xz"] ?? 150));
@@ -2008,6 +2119,97 @@ function startRandomFly(bot) {
   };
 
   setTimeout(loop, randomMs(5000, 15000)); // start 5-15s after spawn
+}
+
+function startPatternFly(bot, rf = {}) {
+  const forwardMs = Math.max(250, Number(rf["pattern-forward-ms"] ?? 10000));
+  const upMs = Math.max(100, Number(rf["pattern-up-ms"] ?? 1000));
+  const waitMs = Math.max(1000, Number(rf["pattern-wait-ms"] ?? 10 * 60 * 1000));
+  const downMs = Math.max(250, Number(rf["pattern-down-ms"] ?? 10000));
+
+  const setStateSafe = (key, val) => {
+    try {
+      bot?.setControlState?.(key, val);
+    } catch (_) {}
+  };
+
+  const clearFlightControls = () => {
+    setStateSafe("forward", false);
+    setStateSafe("back", false);
+    setStateSafe("left", false);
+    setStateSafe("right", false);
+    setStateSafe("jump", false);
+    setStateSafe("sneak", false);
+  };
+
+  const doCameraChange = () => {
+    try {
+      // yaw: 0..360deg, pitch: -0.6..0.6
+      const yaw = Math.random() * Math.PI * 2;
+      const pitch = (Math.random() * 1.2 - 0.6);
+      bot.look?.(yaw, pitch, false);
+    } catch (_) {}
+  };
+
+  let stopped = false;
+  let timer = null;
+
+  const stop = () => {
+    stopped = true;
+    if (timer) clearTimeout(timer);
+    timer = null;
+    clearFlightControls();
+  };
+
+  bot.once("end", stop);
+  bot.once("kicked", stop);
+  bot.once("error", stop);
+
+  const stepForward = () => {
+    if (stopped || !bot || !botState.connected) return;
+    clearFlightControls();
+    setStateSafe("forward", true);
+    timer = setTimeout(() => {
+      setStateSafe("forward", false);
+      doCameraChange();
+      stepUp();
+    }, forwardMs);
+    botState.lastActivity = Date.now();
+  };
+
+  const stepUp = () => {
+    if (stopped || !bot || !botState.connected) return;
+    clearFlightControls();
+    setStateSafe("jump", true);
+    timer = setTimeout(() => {
+      setStateSafe("jump", false);
+      stepWait();
+    }, upMs);
+    botState.lastActivity = Date.now();
+  };
+
+  const stepWait = () => {
+    if (stopped || !bot || !botState.connected) return;
+    clearFlightControls();
+    timer = setTimeout(() => {
+      stepDown();
+    }, waitMs);
+  };
+
+  const stepDown = () => {
+    if (stopped || !bot || !botState.connected) return;
+    clearFlightControls();
+    // In creative flight, "sneak" moves downward.
+    setStateSafe("sneak", true);
+    timer = setTimeout(() => {
+      setStateSafe("sneak", false);
+      stepForward();
+    }, downMs);
+    botState.lastActivity = Date.now();
+  };
+
+  // start a few seconds after spawn so other modules finish initializing
+  timer = setTimeout(stepForward, 5000);
 }
 
 // ============================================================
