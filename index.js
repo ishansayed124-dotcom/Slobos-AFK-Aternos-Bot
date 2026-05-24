@@ -2558,12 +2558,24 @@ process.on("unhandledRejection", (reason) => {
     msg.includes("timed out") ||
     msg.includes("PartialReadError");
 
+  // IMPORTANT:
+  // ETIMEDOUT can come from unrelated outbound requests (e.g. webhook/ping) while the bot is still connected.
+  // In that case, forcing a reconnect kicks the bot and can stop the Aternos server.
+  // Only trigger reconnect recovery when we are already disconnected (or disconnecting).
   if (isNetworkError && !isReconnecting) {
-    addLog("[FATAL] Network rejection — triggering reconnect...");
+    if (botState.connected) {
+      addLog(
+        "[FATAL] Network rejection while connected — ignoring to avoid unnecessary disconnect",
+      );
+      return;
+    }
+    addLog("[FATAL] Network rejection while disconnected — triggering reconnect...");
     clearAllIntervals();
     botState.connected = false;
     if (bot) {
-      try { bot.end(); } catch (_) {}
+      try {
+        bot.end();
+      } catch (_) {}
       bot = null;
     }
     scheduleReconnect();
