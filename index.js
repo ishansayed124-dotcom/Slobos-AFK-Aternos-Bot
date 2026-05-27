@@ -1562,6 +1562,22 @@ function createBot() {
         );
       }
 
+      // FIX: Start maintenance bot during unexpected disconnect to keep server alive
+      // during the offline window (same as normal leave/rejoin cycle)
+      if (config.utils && config.utils["leave-rejoin"] && config.utils["leave-rejoin"].enabled) {
+        const lr = config.utils["leave-rejoin"];
+        const offlineMs = Number(lr["offline-seconds"] ?? 180) * 1000;
+        const reason_str = (reason || "").toLowerCase();
+        
+        // Start maintenance bot unless it's already running from kicked handler
+        if (!maintenanceBot && !reason_str.includes("user requested")) {
+          addLog(`[AFK] Starting maintenance bot for offline window (${offlineMs / 1000}s)`);
+          startMaintenanceBot(offlineMs + 60000, {
+            connectTimeoutMs: 25000,
+          });
+        }
+      }
+
       // ALWAYS reconnect — bot must never leave the server
       scheduleReconnect();
     });
