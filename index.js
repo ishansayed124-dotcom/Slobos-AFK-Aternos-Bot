@@ -1136,17 +1136,31 @@ setInterval(
 // ============================================================
 let bot = null;
 let maintenanceBot = null;
+let maintenanceBotSpawned = false;
 let maintenanceStopTimer = null;
+let maintenanceRetryTimer = null;
 let activeIntervals = [];
 let reconnectTimeoutId = null;
 let connectionTimeoutId = null;
 let isReconnecting = false;
+
+function isMaintenanceActive() {
+  return !!(maintenanceBot && maintenanceBotSpawned && maintenanceBot.entity);
+}
+
+function clearMaintenanceRetryTimer() {
+  if (maintenanceRetryTimer) {
+    clearTimeout(maintenanceRetryTimer);
+    maintenanceRetryTimer = null;
+  }
+}
 
 function stopMaintenanceBot(reason = "main bot connected") {
   if (maintenanceStopTimer) {
     clearTimeout(maintenanceStopTimer);
     maintenanceStopTimer = null;
   }
+  clearMaintenanceRetryTimer();
   if (!maintenanceBot) return;
   try {
     addLog(`[Maintenance] Stopping (${reason})`);
@@ -1156,13 +1170,18 @@ function stopMaintenanceBot(reason = "main bot connected") {
     /* ignore */
   } finally {
     maintenanceBot = null;
+    maintenanceBotSpawned = false;
   }
 }
 
 function startMaintenanceBot(maxAliveMs, options = {}) {
   const mb = config.utils?.["maintenance-bot"];
   if (!mb || !mb.enabled) return Promise.resolve(false);
-  if (maintenanceBot) return Promise.resolve(true);
+  if (isMaintenanceActive()) return Promise.resolve(true);
+  if (maintenanceBot && !maintenanceBotSpawned) {
+    // Stale connection attempt or disconnected instance that has not fully cleared yet.
+    stopMaintenanceBot("restart stale maintenance instance");
+  }
 
   const username = String(mb.username || "Mantanence");
   addLog(`[Maintenance] Starting as ${username}`);
@@ -1204,6 +1223,7 @@ function startMaintenanceBot(maxAliveMs, options = {}) {
 
     maintenanceBot.once("spawn", () => {
       spawned = true;
+      maintenanceBotSpawned = true;
       // Minimal anti-idle: hold sneak (silent).
       try {
         maintenanceBot.setControlState?.("sneak", true);
@@ -1224,6 +1244,7 @@ function startMaintenanceBot(maxAliveMs, options = {}) {
         addLog("[Maintenance] Disconnected before spawn");
       }
       maintenanceBot = null;
+      maintenanceBotSpawned = false;
     });
     maintenanceBot.on("kicked", () => {
       // Don't loop-reconnect; main bot will handle overall uptime.
@@ -1264,8 +1285,30 @@ function startMaintenanceBot(maxAliveMs, options = {}) {
   } catch (e) {
     addLog(`[Maintenance] Failed to start: ${e.message}`);
     maintenanceBot = null;
+    maintenanceBotSpawned = false;
     return Promise.resolve(false);
   }
+}
+
+function ensureMaintenanceBot(maxAliveMs, options = {}) {
+  const mb = config.utils?.["maintenance-bot"];
+  if (!mb || !mb.enabled) return Promise.resolve(false);
+  if (isMaintenanceActive()) return Promise.resolve(true);
+
+  clearMaintenanceRetryTimer();
+
+  return startMaintenanceBot(maxAliveMs, options).then((started) => {
+    if (started) return true;
+    if (botState.connected) return false;
+
+    maintenanceRetryTimer = setTimeout(() => {
+      if (!botState.connected) {
+        ensureMaintenanceBot(maxAliveMs, options);
+      }
+    }, 5000);
+
+    return false;
+  });
 }
 
 function clearBotTimeouts() {
@@ -1383,7 +1426,7 @@ function createBot() {
         onBeforeLeave: ({ offlineMs }) => {
           // Aternos pauses/stops quickly when the server is empty.
           // Keep one lightweight "maintenance" connection online during the offline window.
-          return startMaintenanceBot(Number(offlineMs) + 60000, {
+          return ensureMaintenanceBot(Number(offlineMs) + 60000, {
             connectTimeoutMs: 25000,
           });
         },
@@ -1521,7 +1564,7 @@ function createBot() {
         const cooloff = 120000 + Math.floor(Math.random() * 180000); // 2-5 min
         botState.forcedReconnectDelayMs = cooloff;
         addLog("[Kick] Long-session kick detected");
-        startMaintenanceBot(cooloff + 60000);
+        ensureMaintenanceBot(cooloff + 60000);
       }
 
       if (
@@ -1570,9 +1613,9 @@ function createBot() {
         const reason_str = (reason || "").toLowerCase();
         
         // Start maintenance bot unless it's already running from kicked handler
-        if (!maintenanceBot && !reason_str.includes("user requested")) {
+      if (!isMaintenanceActive() && !reason_str.includes("user requested")) {
           addLog(`[AFK] Starting maintenance bot for offline window (${offlineMs / 1000}s)`);
-          startMaintenanceBot(offlineMs + 60000, {
+          ensureMaintenanceBot(offlineMs + 60000, {
             connectTimeoutMs: 25000,
           });
         }
