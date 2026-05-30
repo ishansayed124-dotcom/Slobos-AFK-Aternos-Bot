@@ -15,9 +15,9 @@
     "enabled": true,
     "teleport-on-join": true,
     "silent": true,
-    "x": 0,
-    "y": 80,
-    "z": 0
+    "x": -5,
+    "y": 65,
+    "z": -14
   },
   "utils": {
     "auto-auth": {
@@ -51,7 +51,11 @@
       "chance": 1,
       "min-delay-seconds": 45,
       "max-delay-seconds": 120,
-      "auto-give-if-missing": false
+      "auto-give-if-missing": false,
+      "item-name": "golden_apple",
+      "ban-time-only": true,
+      "ban-time-delay-seconds": 5940,
+      "ban-time-jitter-seconds": 300
     },
     "auto-reconnect": true,
     "auto-reconnect-delay": 5000,

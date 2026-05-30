@@ -1338,6 +1338,77 @@ function addInterval(callback, delay) {
   return id;
 }
 
+function isCreativeMode(bot) {
+  const gm = bot?.game?.gameMode ?? bot?.game?.mode;
+  if (gm == null) return false;
+  if (typeof gm === "string") return gm.toLowerCase() === "creative";
+  return gm === 1;
+}
+
+function getCreativeDropItemName() {
+  const itemName = String(config.utils?.["creative-eat"]?.["item-name"] ?? "golden_apple").trim();
+  return itemName || "golden_apple";
+}
+
+async function removeInventoryItemsByName(bot, itemName) {
+  const targetName = String(itemName || "").trim().toLowerCase();
+  if (!bot || !bot.inventory || !targetName) return false;
+
+  let openedWindow = null;
+  if (typeof bot.openInventory === "function") {
+    try {
+      openedWindow = await bot.openInventory();
+    } catch (err) {
+      addLog(`[CreativeDrop] Could not open inventory: ${err?.message || err}`);
+    }
+  }
+
+  const items = bot.inventory
+    .items()
+    .filter((item) => item?.name?.toLowerCase() === targetName);
+
+  if (!items.length) {
+    addLog(`[CreativeDrop] No ${targetName} found in inventory.`);
+    return false;
+  }
+
+  let removedAny = false;
+  for (const item of items) {
+    const slot =
+      Number.isInteger(item?.slot) && item.slot >= 0
+        ? item.slot
+        : bot.inventory.slots.findIndex(
+            (slotItem, index) => index >= 0 && slotItem?.name?.toLowerCase() === targetName,
+          );
+
+    if (slot < 0) continue;
+
+    try {
+      if (bot.creative && typeof bot.creative.clearSlot === "function") {
+        await bot.creative.clearSlot(slot);
+      } else if (typeof bot.clickWindow === "function") {
+        await bot.clickWindow(slot, 0, 4);
+      } else {
+        continue;
+      }
+      removedAny = true;
+      addLog(`[CreativeDrop] Removed ${item.name} from slot ${slot}.`);
+    } catch (err) {
+      addLog(`[CreativeDrop] Failed to remove ${item.name} from slot ${slot}: ${err?.message || err}`);
+    }
+  }
+
+  if (openedWindow?.close) {
+    try {
+      openedWindow.close();
+    } catch (err) {
+      addLog(`[CreativeDrop] Failed to close inventory window: ${err?.message || err}`);
+    }
+  }
+
+  return removedAny;
+}
+
 function getReconnectDelay() {
   if (botState.forcedReconnectDelayMs != null) {
     const forced = Math.max(0, Number(botState.forcedReconnectDelayMs));
@@ -1424,6 +1495,16 @@ function createBot() {
           botState.forcedReconnectDelayMs = ms;
         },
         onBeforeLeave: ({ offlineMs }) => {
+          const creativeEat = config.utils?.["creative-eat"];
+          if (creativeEat?.enabled && creativeEat["ban-time-only"] && isCreativeMode(bot)) {
+            const dropItemName = getCreativeDropItemName();
+            return removeInventoryItemsByName(bot, dropItemName).then(() =>
+              ensureMaintenanceBot(Number(offlineMs) + 60000, {
+                connectTimeoutMs: 25000,
+              }),
+            );
+          }
+
           // Aternos pauses/stops quickly when the server is empty.
           // Keep one lightweight "maintenance" connection online during the offline window.
           return ensureMaintenanceBot(Number(offlineMs) + 60000, {
@@ -1671,6 +1752,39 @@ function scheduleReconnect() {
   }, delay);
 }
 
+function scheduleBanWindowCreativeDrop(bot, delayMs, itemName) {
+  if (!bot || !botState.connected) return null;
+
+  const safeDelayMs = Math.max(0, Number(delayMs) || 0);
+  if (safeDelayMs === 0) return null;
+
+  const targetName = String(itemName || "").trim();
+  if (!targetName) return null;
+
+  const timerId = setTimeout(() => {
+    if (!bot || !botState.connected) return;
+    removeInventoryItemsByName(bot, targetName);
+  }, safeDelayMs);
+
+  bot.once("end", () => clearTimeout(timerId));
+  bot.once("kicked", () => clearTimeout(timerId));
+  bot.once("error", () => clearTimeout(timerId));
+
+  addLog(
+    `[CreativeDrop] Scheduled ban-window drop for ${targetName} in ${Math.round(safeDelayMs / 1000)}s.`,
+  );
+
+  return timerId;
+}
+
+function randomizeDelayMs(baseMs, jitterMs) {
+  const safeBaseMs = Math.max(0, Number(baseMs) || 0);
+  const safeJitterMs = Math.max(0, Number(jitterMs) || 0);
+  if (safeJitterMs === 0) return safeBaseMs;
+  const offset = Math.floor(Math.random() * (safeJitterMs * 2 + 1)) - safeJitterMs;
+  return Math.max(0, safeBaseMs + offset);
+}
+
 // ============================================================
 // MODULE INITIALIZATION
 // ============================================================
@@ -1781,16 +1895,12 @@ function initializeModules(bot, mcData, defaultMove) {
     const minDelaySec = Number(ce["min-delay-seconds"] ?? 240);
     const maxDelaySec = Number(ce["max-delay-seconds"] ?? 720);
     const autoGive = !!ce["auto-give-if-missing"];
+    const banTimeOnly = !!ce["ban-time-only"];
+    const banTimeDelaySec = Number(ce["ban-time-delay-seconds"] ?? 5940);
+    const banTimeJitterSec = Number(ce["ban-time-jitter-seconds"] ?? 300);
 
     const randomMs = (minMs, maxMs) =>
       Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
-
-    const isCreative = () => {
-      const gm = bot?.game?.gameMode ?? bot?.game?.mode;
-      if (gm == null) return false;
-      if (typeof gm === "string") return gm.toLowerCase() === "creative";
-      return gm === 1; // mineflayer commonly uses 0/1/2/3
-    };
 
     const scheduleNextEat = () => {
       const minMs = Math.max(10_000, minDelaySec * 1000);
@@ -1802,45 +1912,58 @@ function initializeModules(bot, mcData, defaultMove) {
     const maxMs = Math.max(minMs, maxDelaySec * 1000);
     let nextEatAt = Date.now() + randomMs(minMs, maxMs);
 
-    addInterval(() => {
-      if (!bot || !botState.connected) return;
-      if (!isCreative()) return;
-      if (Date.now() < nextEatAt) return;
-
-      nextEatAt = scheduleNextEat();
-
-      if (Math.random() > chance) return;
-
-      const goldenApple = bot.inventory
-        ?.items()
-        ?.find((item) => item?.name === "golden_apple");
-
-      if (!goldenApple) {
-        addLog("[CreativeEat] No golden apple in inventory.");
-        if (autoGive) {
-          addLog("[CreativeEat] Trying /give (requires OP).");
-          bot.chat("/give @s golden_apple 1");
+    if (banTimeOnly) {
+      addLog(`[CreativeDrop] Ban-time-only mode enabled for ${getCreativeDropItemName()}.`);
+      bot.once("spawn", () => {
+        const delayMs = randomizeDelayMs(
+          banTimeDelaySec * 1000,
+          banTimeJitterSec * 1000,
+        );
+        if (delayMs > 0) {
+          scheduleBanWindowCreativeDrop(bot, delayMs, getCreativeDropItemName());
         }
-        return;
-      }
+      });
+    } else {
+      addInterval(() => {
+        if (!bot || !botState.connected) return;
+        if (!isCreativeMode(bot)) return;
+        if (Date.now() < nextEatAt) return;
 
-      bot.equip(goldenApple, "hand")
-        .then(() => bot.consume())
-        .then(() => {
-          botState.lastActivity = Date.now();
-          addLog("[CreativeEat] Ate a golden apple (creative).");
-          setTimeout(() => {
-            try {
-              bot.setQuickBarSlot(0);
-            } catch (e) {
-              /* ignore */
-            }
-          }, 2500);
-        })
-        .catch((err) => {
-          addLog(`[CreativeEat] Failed: ${err?.message || err}`);
+        nextEatAt = scheduleNextEat();
+
+        if (Math.random() > chance) return;
+
+        const goldenApple = bot.inventory
+          ?.items()
+          ?.find((item) => item?.name === getCreativeDropItemName());
+
+        if (!goldenApple) {
+          addLog(`[CreativeEat] No ${getCreativeDropItemName()} in inventory.`);
+          if (autoGive) {
+            addLog("[CreativeEat] Trying /give (requires OP).");
+            bot.chat(`/give @s ${getCreativeDropItemName()} 1`);
+          }
+          return;
+        }
+
+        bot.equip(goldenApple, "hand")
+          .then(() => bot.consume())
+          .then(() => {
+            botState.lastActivity = Date.now();
+            addLog(`[CreativeEat] Used ${getCreativeDropItemName()} (creative).`);
+            setTimeout(() => {
+              try {
+                bot.setQuickBarSlot(0);
+              } catch (e) {
+                /* ignore */
+              }
+            }, 2500);
+          })
+          .catch((err) => {
+            addLog(`[CreativeEat] Failed: ${err?.message || err}`);
         });
-    }, 10_000);
+      }, 10_000);
+    }
   }
 
   // ---------- MOVE TO POSITION ----------
