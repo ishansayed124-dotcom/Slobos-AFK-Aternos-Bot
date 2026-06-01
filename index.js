@@ -31,7 +31,7 @@ let botState = {
   pendingMainBotGeneration: null,
 };
 
-const mainBotUsernameRoot = String(config["bot-account"]?.username || "Serehume").trim() || "Serehume";
+const mainBotUsernameRoot = String(config["bot-account"]?.username || "ServerHuMef").trim() || "ServerHuMef";
 
 function buildMainBotUsername(generation = 0) {
   const safeGeneration = Math.max(0, Number(generation) || 0);
@@ -1609,7 +1609,7 @@ function createBot() {
       host: config.server.ip,
       port: config.server.port,
       version: botVersion,
-      hideErrors: false,
+      hideErrors: true,
       checkTimeoutInterval: 600000,
     });
     const currentBot = bot;
@@ -2877,6 +2877,16 @@ process.on("uncaughtException", (err) => {
 
   if (isNetworkError) {
     addLog("[FATAL] Known network/protocol error - recovering gracefully...");
+  }
+
+  if (isNetworkError && (isReconnecting || reconnectTimeoutId)) {
+    addLog("[FATAL] Reconnect already scheduled; ignoring duplicate network exception.");
+    return;
+  }
+
+  if (!botRunning || botState.reconnectBlockedReason) {
+    addLog("[FATAL] Recovery skipped because reconnect is disabled.");
+    return;
   }
 
   // ALWAYS recover — bot must never stay disconnected
