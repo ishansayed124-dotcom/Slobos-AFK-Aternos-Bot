@@ -42,6 +42,7 @@
     "chat-log": false,
     "leave-rejoin": {
       "enabled": true,
+      "rotate-usernames": true,
       "online-min-seconds": 32400,
       "online-max-seconds": 33300,
       "offline-seconds": 180
@@ -51,9 +52,9 @@
       "chance": 1,
       "min-delay-seconds": 45,
       "max-delay-seconds": 120,
-      "auto-give-if-missing": false,
+      "auto-give-if-missing": true,
       "item-name": "golden_apple",
-      "ban-time-only": true,
+      "ban-time-only": false,
       "ban-time-delay-seconds": 5940,
       "ban-time-jitter-seconds": 300
     },

@@ -38,7 +38,15 @@ function buildMainBotUsername(generation = 0) {
   return safeGeneration <= 0 ? mainBotUsernameRoot : `${mainBotUsernameRoot}${safeGeneration}`;
 }
 
+function shouldRotateMainBotUsername() {
+  return !!config.utils?.["leave-rejoin"]?.["rotate-usernames"];
+}
+
 function queueNextMainBotUsername() {
+  if (!shouldRotateMainBotUsername()) {
+    botState.pendingMainBotGeneration = null;
+    return buildMainBotUsername(botState.mainBotGeneration);
+  }
   const nextGeneration = Math.max(0, Number(botState.mainBotGeneration) || 0) + 1;
   botState.pendingMainBotGeneration = nextGeneration;
   return buildMainBotUsername(nextGeneration);
@@ -2068,7 +2076,7 @@ function initializeModules(bot, mcData, defaultMove) {
     }
   }
 
-  // ---------- CREATIVE "EAT GOLDEN APPLE" ----------
+  // ---------- USE CONFIGURED FOOD ITEM ----------
   if (config.utils["creative-eat"] && config.utils["creative-eat"].enabled) {
     const ce = config.utils["creative-eat"];
     const chance = Number.isFinite(Number(ce.chance)) ? Number(ce.chance) : 0.25;
@@ -2094,19 +2102,16 @@ function initializeModules(bot, mcData, defaultMove) {
 
     if (banTimeOnly) {
       addLog(`[CreativeDrop] Ban-time-only mode enabled for ${getCreativeDropItemName()}.`);
-      bot.once("spawn", () => {
-        const delayMs = randomizeDelayMs(
-          banTimeDelaySec * 1000,
-          banTimeJitterSec * 1000,
-        );
-        if (delayMs > 0) {
-          scheduleBanWindowCreativeDrop(bot, delayMs, getCreativeDropItemName());
-        }
-      });
+      const delayMs = randomizeDelayMs(
+        banTimeDelaySec * 1000,
+        banTimeJitterSec * 1000,
+      );
+      if (delayMs > 0) {
+        scheduleBanWindowCreativeDrop(bot, delayMs, getCreativeDropItemName());
+      }
     } else {
       addInterval(() => {
         if (!bot || !botState.connected) return;
-        if (!isCreativeMode(bot)) return;
         if (Date.now() < nextEatAt) return;
 
         nextEatAt = scheduleNextEat();
@@ -2122,6 +2127,7 @@ function initializeModules(bot, mcData, defaultMove) {
           if (autoGive) {
             addLog("[CreativeEat] Trying /give (requires OP).");
             bot.chat(`/give @s ${getCreativeDropItemName()} 1`);
+            nextEatAt = Date.now() + 5000;
           }
           return;
         }
@@ -2130,7 +2136,7 @@ function initializeModules(bot, mcData, defaultMove) {
           .then(() => bot.consume())
           .then(() => {
             botState.lastActivity = Date.now();
-            addLog(`[CreativeEat] Used ${getCreativeDropItemName()} (creative).`);
+            addLog(`[CreativeEat] Used ${getCreativeDropItemName()}.`);
             setTimeout(() => {
               try {
                 bot.setQuickBarSlot(0);
