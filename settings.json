@@ -1,7 +1,7 @@
 {
   "name": "AFK Bot",
   "bot-account": {
-    "username": "ServerHuMef",
+    "username": "Serehume",
     "password": "",
     "type": "offline"
   },
@@ -42,8 +42,8 @@
     "chat-log": false,
     "leave-rejoin": {
       "enabled": true,
-      "online-min-seconds": 14400,
-      "online-max-seconds": 21600,
+      "online-min-seconds": 32400,
+      "online-max-seconds": 33300,
       "offline-seconds": 180
     },
     "creative-eat": {
@@ -62,7 +62,7 @@
     "max-reconnect-delay": 120000,
     "maintenance-bot": {
       "enabled": true,
-      "username": "Mantanence"
+      "username": "Maintenance"
     }
   },
   "movement": {

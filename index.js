@@ -27,7 +27,37 @@ let botState = {
   wasThrottled: false,
   forcedReconnectDelayMs: null,
   reconnectBlockedReason: null,
+  mainBotGeneration: 0,
+  pendingMainBotGeneration: null,
 };
+
+const mainBotUsernameRoot = String(config["bot-account"]?.username || "Serehume").trim() || "Serehume";
+
+function buildMainBotUsername(generation = 0) {
+  const safeGeneration = Math.max(0, Number(generation) || 0);
+  return safeGeneration <= 0 ? mainBotUsernameRoot : `${mainBotUsernameRoot}${safeGeneration}`;
+}
+
+function queueNextMainBotUsername() {
+  const nextGeneration = Math.max(0, Number(botState.mainBotGeneration) || 0) + 1;
+  botState.pendingMainBotGeneration = nextGeneration;
+  return buildMainBotUsername(nextGeneration);
+}
+
+function consumeMainBotUsername() {
+  const generation =
+    Number.isInteger(botState.pendingMainBotGeneration)
+      ? botState.pendingMainBotGeneration
+      : Math.max(0, Number(botState.mainBotGeneration) || 0);
+  const username = buildMainBotUsername(generation);
+  return { generation, username };
+}
+
+function commitMainBotUsernameGeneration() {
+  if (!Number.isInteger(botState.pendingMainBotGeneration)) return;
+  botState.mainBotGeneration = botState.pendingMainBotGeneration;
+  botState.pendingMainBotGeneration = null;
+}
 
 // Health check endpoint for monitoring
 app.get('/', (req, res) => {
@@ -993,6 +1023,7 @@ app.post("/stop", (req, res) => {
   if (!botRunning) return res.json({ success: false, msg: "Already stopped" });
 
   botRunning = false;
+  botState.pendingMainBotGeneration = null;
 
   if (bot) {
     bot.end();
@@ -1139,6 +1170,11 @@ let maintenanceBot = null;
 let maintenanceBotSpawned = false;
 let maintenanceStopTimer = null;
 let maintenanceRetryTimer = null;
+let maintenanceMotionTimers = {
+  teleport: null,
+  up: null,
+  down: null,
+};
 let activeIntervals = [];
 let reconnectTimeoutId = null;
 let connectionTimeoutId = null;
@@ -1155,15 +1191,98 @@ function clearMaintenanceRetryTimer() {
   }
 }
 
+function clearMaintenanceMotionTimers() {
+  Object.keys(maintenanceMotionTimers).forEach((key) => {
+    if (maintenanceMotionTimers[key]) {
+      clearTimeout(maintenanceMotionTimers[key]);
+      maintenanceMotionTimers[key] = null;
+    }
+  });
+}
+
+function stopMaintenanceMotion() {
+  clearMaintenanceMotionTimers();
+  if (!maintenanceBot) return;
+  try {
+    maintenanceBot.setControlState?.("jump", false);
+    maintenanceBot.setControlState?.("sneak", false);
+  } catch (e) {
+    /* ignore */
+  }
+}
+
+function startMaintenanceMotionCycle() {
+  clearMaintenanceMotionTimers();
+  if (!maintenanceBot || !maintenanceBot.entity) return;
+
+  const baseX =
+    Number.isFinite(Number(config.position?.x)) && config.position?.enabled
+      ? Number(config.position.x)
+      : Math.floor(maintenanceBot.entity.position.x);
+  const baseZ =
+    Number.isFinite(Number(config.position?.z)) && config.position?.enabled
+      ? Number(config.position.z)
+      : Math.floor(maintenanceBot.entity.position.z);
+  const targetY = 80;
+
+  const teleportToLane = () => {
+    if (!maintenanceBot || !maintenanceBot.entity) return false;
+    try {
+      maintenanceBot.chat(`/tp @s ${Math.floor(baseX)} ${targetY} ${Math.floor(baseZ)}`);
+      return true;
+    } catch (e) {
+      addLog(`[Maintenance] Teleport failed: ${e?.message || e}`);
+      return false;
+    }
+  };
+
+  const tryCreative = () => {
+    if (!maintenanceBot || !maintenanceBot.entity) return;
+    try {
+      maintenanceBot.chat("/gamemode creative");
+    } catch (e) {
+      /* ignore */
+    }
+  };
+
+  const cycle = (goingUp) => {
+    if (!maintenanceBot || !maintenanceBot.entity) return;
+
+    try {
+      maintenanceBot.setControlState?.("forward", false);
+      maintenanceBot.setControlState?.("jump", false);
+      maintenanceBot.setControlState?.("sneak", false);
+      maintenanceBot.setControlState?.("jump", Boolean(goingUp));
+      maintenanceBot.setControlState?.("sneak", !goingUp);
+    } catch (e) {
+      /* ignore */
+    }
+
+    const delay = goingUp ? 7000 : 5000;
+    const nextKey = goingUp ? "down" : "up";
+    maintenanceMotionTimers[nextKey] = setTimeout(() => cycle(!goingUp), delay);
+  };
+
+  maintenanceMotionTimers.teleport = setTimeout(() => {
+    if (!maintenanceBot || !maintenanceBot.entity) return;
+    tryCreative();
+    teleportToLane();
+    cycle(true);
+  }, 2500);
+}
+
 function stopMaintenanceBot(reason = "main bot connected") {
   if (maintenanceStopTimer) {
     clearTimeout(maintenanceStopTimer);
     maintenanceStopTimer = null;
   }
   clearMaintenanceRetryTimer();
+  stopMaintenanceMotion();
   if (!maintenanceBot) return;
   try {
     addLog(`[Maintenance] Stopping (${reason})`);
+    maintenanceBot.setControlState?.("jump", false);
+    maintenanceBot.setControlState?.("sneak", false);
     maintenanceBot.removeAllListeners();
     maintenanceBot.end();
   } catch (e) {
@@ -1211,7 +1330,7 @@ function startMaintenanceBot(maxAliveMs, options = {}) {
       return ok;
     };
 
-    maintenanceBot = mineflayer.createBot({
+  maintenanceBot = mineflayer.createBot({
       username,
       auth: config["bot-account"].type,
       host: config.server.ip,
@@ -1224,12 +1343,7 @@ function startMaintenanceBot(maxAliveMs, options = {}) {
     maintenanceBot.once("spawn", () => {
       spawned = true;
       maintenanceBotSpawned = true;
-      // Minimal anti-idle: hold sneak (silent).
-      try {
-        maintenanceBot.setControlState?.("sneak", true);
-      } catch (e) {
-        /* ignore */
-      }
+      startMaintenanceMotionCycle();
       if (typeof options.onSpawn === "function") {
         try {
           options.onSpawn();
@@ -1240,6 +1354,7 @@ function startMaintenanceBot(maxAliveMs, options = {}) {
     });
 
     maintenanceBot.on("end", () => {
+      stopMaintenanceMotion();
       if (!spawned) {
         addLog("[Maintenance] Disconnected before spawn");
       }
@@ -1247,10 +1362,12 @@ function startMaintenanceBot(maxAliveMs, options = {}) {
       maintenanceBotSpawned = false;
     });
     maintenanceBot.on("kicked", () => {
+      stopMaintenanceMotion();
       // Don't loop-reconnect; main bot will handle overall uptime.
       stopMaintenanceBot("kicked");
     });
     maintenanceBot.on("error", () => {
+      stopMaintenanceMotion();
       stopMaintenanceBot("error");
     });
 
@@ -1456,7 +1573,10 @@ function createBot() {
   }
 
   addLog(`[Bot] Creating bot instance...`);
-  addLog(`[Bot] Connecting to ${config.server.ip}:${config.server.port}`);
+  const { generation, username } = consumeMainBotUsername();
+  addLog(
+    `[Bot] Connecting as ${username} (cycle ${generation}) to ${config.server.ip}:${config.server.port}`,
+  );
 
   try {
     // FIX: use version:false to auto-detect server version so the bot can join any server.
@@ -1466,7 +1586,7 @@ function createBot() {
         ? config.server.version
         : false;
     bot = mineflayer.createBot({
-      username: config["bot-account"].username,
+      username,
       password: config["bot-account"].password || undefined,
       auth: config["bot-account"].type,
       host: config.server.ip,
@@ -1495,6 +1615,8 @@ function createBot() {
           botState.forcedReconnectDelayMs = ms;
         },
         onBeforeLeave: ({ offlineMs }) => {
+          const nextUsername = queueNextMainBotUsername();
+          addLog(`[AFK] Next main bot queued: ${nextUsername}`);
           const creativeEat = config.utils?.["creative-eat"];
           if (creativeEat?.enabled && creativeEat["ban-time-only"] && isCreativeMode(bot)) {
             const dropItemName = getCreativeDropItemName();
@@ -1542,6 +1664,7 @@ function createBot() {
       spawnHandled = true;
 
       clearBotTimeouts();
+      commitMainBotUsernameGeneration();
       botState.connected = true;
       botState.lastActivity = Date.now();
       botState.reconnectAttempts = 0;
