@@ -1170,6 +1170,9 @@ let maintenanceBot = null;
 let maintenanceBotSpawned = false;
 let maintenanceStopTimer = null;
 let maintenanceRetryTimer = null;
+let maintenanceConnectTimer = null;
+let maintenanceStartResolve = null;
+let maintenanceAttemptId = 0;
 let maintenanceMotionTimers = {
   teleport: null,
   up: null,
@@ -1179,6 +1182,7 @@ let activeIntervals = [];
 let reconnectTimeoutId = null;
 let connectionTimeoutId = null;
 let isReconnecting = false;
+let activeConnectionAttemptId = 0;
 
 function isMaintenanceActive() {
   return !!(maintenanceBot && maintenanceBotSpawned && maintenanceBot.entity);
@@ -1189,6 +1193,22 @@ function clearMaintenanceRetryTimer() {
     clearTimeout(maintenanceRetryTimer);
     maintenanceRetryTimer = null;
   }
+}
+
+function clearMaintenanceConnectTimer() {
+  if (maintenanceConnectTimer) {
+    clearTimeout(maintenanceConnectTimer);
+    maintenanceConnectTimer = null;
+  }
+}
+
+function finishMaintenanceStart(ok, attemptId = maintenanceAttemptId) {
+  if (attemptId !== maintenanceAttemptId) return ok;
+  clearMaintenanceConnectTimer();
+  const resolve = maintenanceStartResolve;
+  maintenanceStartResolve = null;
+  if (resolve) resolve(ok);
+  return ok;
 }
 
 function clearMaintenanceMotionTimers() {
@@ -1277,6 +1297,7 @@ function stopMaintenanceBot(reason = "main bot connected") {
     maintenanceStopTimer = null;
   }
   clearMaintenanceRetryTimer();
+  finishMaintenanceStart(false);
   stopMaintenanceMotion();
   if (!maintenanceBot) return;
   try {
@@ -1317,20 +1338,9 @@ function startMaintenanceBot(maxAliveMs, options = {}) {
         : false;
 
     let spawned = false;
-    let resolved = false;
-    let connectTimer = null;
+    const attemptId = ++maintenanceAttemptId;
 
-    const done = (ok) => {
-      if (resolved) return;
-      resolved = true;
-      if (connectTimer) {
-        clearTimeout(connectTimer);
-        connectTimer = null;
-      }
-      return ok;
-    };
-
-  maintenanceBot = mineflayer.createBot({
+    maintenanceBot = mineflayer.createBot({
       username,
       auth: config["bot-account"].type,
       host: config.server.ip,
@@ -1340,7 +1350,10 @@ function startMaintenanceBot(maxAliveMs, options = {}) {
       checkTimeoutInterval: 600000,
     });
 
+    const currentMaintenanceBot = maintenanceBot;
+
     maintenanceBot.once("spawn", () => {
+      if (attemptId !== maintenanceAttemptId || maintenanceBot !== currentMaintenanceBot) return;
       spawned = true;
       maintenanceBotSpawned = true;
       startMaintenanceMotionCycle();
@@ -1351,12 +1364,15 @@ function startMaintenanceBot(maxAliveMs, options = {}) {
           /* ignore */
         }
       }
+      finishMaintenanceStart(true, attemptId);
     });
 
     maintenanceBot.on("end", () => {
+      if (attemptId !== maintenanceAttemptId || maintenanceBot !== currentMaintenanceBot) return;
       stopMaintenanceMotion();
       if (!spawned) {
         addLog("[Maintenance] Disconnected before spawn");
+        finishMaintenanceStart(false, attemptId);
       }
       maintenanceBot = null;
       maintenanceBotSpawned = false;
@@ -1379,28 +1395,28 @@ function startMaintenanceBot(maxAliveMs, options = {}) {
 
     // Return a promise that resolves once we have spawned (or timed out).
     return new Promise((resolve) => {
-      connectTimer = setTimeout(() => {
+      maintenanceStartResolve = resolve;
+      clearMaintenanceConnectTimer();
+      maintenanceConnectTimer = setTimeout(() => {
+        if (attemptId !== maintenanceAttemptId) return;
         if (!spawned) {
           addLog(
             `[Maintenance] Spawn timeout after ${Math.round(
               connectTimeoutMs / 1000,
             )}s`,
           );
+          finishMaintenanceStart(false, attemptId);
           try {
             stopMaintenanceBot("spawn timeout");
           } catch (_) {}
-          resolve(done(false));
           return;
         }
-        resolve(done(true));
+        finishMaintenanceStart(true, attemptId);
       }, connectTimeoutMs);
-
-      maintenanceBot.once("spawn", () => {
-        resolve(done(true));
-      });
     });
   } catch (e) {
     addLog(`[Maintenance] Failed to start: ${e.message}`);
+    finishMaintenanceStart(false);
     maintenanceBot = null;
     maintenanceBotSpawned = false;
     return Promise.resolve(false);
@@ -1579,6 +1595,7 @@ function createBot() {
   );
 
   try {
+    const connectionAttemptId = ++activeConnectionAttemptId;
     // FIX: use version:false to auto-detect server version so the bot can join any server.
     // If the user explicitly sets a version in settings.json it is still respected.
     const botVersion =
@@ -1595,6 +1612,23 @@ function createBot() {
       hideErrors: false,
       checkTimeoutInterval: 600000,
     });
+    const currentBot = bot;
+
+    function failCurrentConnection(reason) {
+      if (connectionAttemptId !== activeConnectionAttemptId || bot !== currentBot) return;
+      clearBotTimeouts();
+      botState.connected = false;
+      clearAllIntervals();
+      try {
+        currentBot.removeAllListeners();
+        currentBot.end();
+      } catch (e) {
+        /* ignore */
+      }
+      if (bot === currentBot) bot = null;
+      addLog(`[Bot] Connection failed before spawn (${reason}); scheduling reconnect`);
+      scheduleReconnect();
+    }
 
     bot.loadPlugin(pathfinder);
 
@@ -1643,15 +1677,15 @@ function createBot() {
     // FIX: connection timeout - end the old bot before reconnecting to avoid ghost bots
     clearBotTimeouts();
     connectionTimeoutId = setTimeout(() => {
-      if (!botState.connected) {
+      if (!botState.connected && connectionAttemptId === activeConnectionAttemptId && bot === currentBot) {
         addLog("[Bot] Connection timeout - no spawn received");
         try {
-          bot.removeAllListeners();
-          bot.end();
+          currentBot.removeAllListeners();
+          currentBot.end();
         } catch (e) {
           /* ignore */
         }
-        bot = null;
+        if (bot === currentBot) bot = null;
         scheduleReconnect();
       }
     }, 150000); // 150s - Aternos servers can take 90-120s to finish spawning a player
@@ -1660,6 +1694,7 @@ function createBot() {
     let spawnHandled = false;
 
     bot.once("spawn", () => {
+      if (connectionAttemptId !== activeConnectionAttemptId || bot !== currentBot) return;
       if (spawnHandled) return;
       spawnHandled = true;
 
@@ -1717,6 +1752,7 @@ function createBot() {
     // FIX: 'kicked' fires before 'end'. Remove the scheduleReconnect from 'kicked'
     // so that 'end' is the single source of reconnect truth, preventing double-trigger.
     bot.on("kicked", (reason) => {
+      if (connectionAttemptId !== activeConnectionAttemptId || bot !== currentBot) return;
       // FIX: stringify reason if it's an object to make it readable in logs
       const kickReason =
         typeof reason === "object" ? JSON.stringify(reason) : reason;
@@ -1772,6 +1808,17 @@ function createBot() {
       }
 
       if (
+        reasonStr.includes("not_whitelisted") ||
+        reasonStr.includes("not whitelisted") ||
+        reasonStr.includes("whitelist")
+      ) {
+        botState.reconnectBlockedReason = kickReason;
+        botRunning = false;
+        stopMaintenanceBot("main bot is not whitelisted");
+        addLog("[Bot] Reconnect disabled because the account is not whitelisted.");
+      }
+
+      if (
         reasonStr.includes("you are banned") ||
         reasonStr.includes("banned from this server") ||
         reasonStr.includes("violates our terms of service")
@@ -1793,8 +1840,10 @@ function createBot() {
 
     // FIX: 'end' is the single reconnect trigger
     bot.on("end", (reason) => {
+      if (connectionAttemptId !== activeConnectionAttemptId || bot !== currentBot) return;
       addLog(`[Bot] Disconnected: ${reason || "Unknown reason"}`);
       botState.connected = false;
+      clearBotTimeouts();
       clearAllIntervals();
       spawnHandled = false; // reset for next connection
 
@@ -1811,7 +1860,12 @@ function createBot() {
 
       // FIX: Start maintenance bot during unexpected disconnect to keep server alive
       // during the offline window (same as normal leave/rejoin cycle)
-      if (config.utils && config.utils["leave-rejoin"] && config.utils["leave-rejoin"].enabled) {
+      if (
+        !botState.reconnectBlockedReason &&
+        config.utils &&
+        config.utils["leave-rejoin"] &&
+        config.utils["leave-rejoin"].enabled
+      ) {
         const lr = config.utils["leave-rejoin"];
         const offlineMs = Number(lr["offline-seconds"] ?? 180) * 1000;
         const reason_str = (reason || "").toLowerCase();
@@ -1830,10 +1884,13 @@ function createBot() {
     });
 
     bot.on("error", (err) => {
+      if (connectionAttemptId !== activeConnectionAttemptId || bot !== currentBot) return;
       const msg = err.message || "";
       addLog(`[Bot] Error: ${msg}`);
       botState.errors.push({ type: "error", message: msg, time: Date.now() });
-      // Don't reconnect on error - let 'end' event handle it
+      if (!spawnHandled && !botState.connected) {
+        failCurrentConnection(msg || "network error");
+      }
     });
   } catch (err) {
     addLog(`[Bot] Failed to create bot: ${err.message}`);
