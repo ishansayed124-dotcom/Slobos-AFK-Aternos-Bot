@@ -1181,6 +1181,11 @@ let maintenanceRetryTimer = null;
 let maintenanceConnectTimer = null;
 let maintenanceStartResolve = null;
 let maintenanceAttemptId = 0;
+let maintenanceGiftTimer = null;
+let maintenanceGiftTargetUsername = null;
+let maintenanceGiftItemName = null;
+let maintenanceGiftCompleted = false;
+let maintenanceGiftJoinListener = null;
 let maintenanceMotionTimers = {
   teleport: null,
   up: null,
@@ -1208,6 +1213,22 @@ function clearMaintenanceConnectTimer() {
     clearTimeout(maintenanceConnectTimer);
     maintenanceConnectTimer = null;
   }
+}
+
+function clearMaintenanceGiftHandlers() {
+  if (maintenanceGiftTimer) {
+    clearInterval(maintenanceGiftTimer);
+    maintenanceGiftTimer = null;
+  }
+  if (maintenanceBot && maintenanceGiftJoinListener) {
+    try {
+      maintenanceBot.removeListener("playerJoined", maintenanceGiftJoinListener);
+    } catch (_) {}
+  }
+  maintenanceGiftJoinListener = null;
+  maintenanceGiftTargetUsername = null;
+  maintenanceGiftItemName = null;
+  maintenanceGiftCompleted = false;
 }
 
 function finishMaintenanceStart(ok, attemptId = maintenanceAttemptId) {
@@ -1264,15 +1285,6 @@ function startMaintenanceMotionCycle() {
     }
   };
 
-  const tryCreative = () => {
-    if (!maintenanceBot || !maintenanceBot.entity) return;
-    try {
-      maintenanceBot.chat("/gamemode creative");
-    } catch (e) {
-      /* ignore */
-    }
-  };
-
   const cycle = (goingUp) => {
     if (!maintenanceBot || !maintenanceBot.entity) return;
 
@@ -1293,7 +1305,6 @@ function startMaintenanceMotionCycle() {
 
   maintenanceMotionTimers.teleport = setTimeout(() => {
     if (!maintenanceBot || !maintenanceBot.entity) return;
-    tryCreative();
     teleportToLane();
     cycle(true);
   }, 2500);
@@ -1306,6 +1317,7 @@ function stopMaintenanceBot(reason = "main bot connected") {
   }
   clearMaintenanceRetryTimer();
   finishMaintenanceStart(false);
+  clearMaintenanceGiftHandlers();
   stopMaintenanceMotion();
   if (!maintenanceBot) return;
   try {
@@ -1365,6 +1377,9 @@ function startMaintenanceBot(maxAliveMs, options = {}) {
       spawned = true;
       maintenanceBotSpawned = true;
       startMaintenanceMotionCycle();
+      if (options.giftTargetUsername) {
+        setupMaintenanceGift(currentMaintenanceBot, options.giftTargetUsername, options.giftItemName);
+      }
       if (typeof options.onSpawn === "function") {
         try {
           options.onSpawn();
@@ -1382,11 +1397,21 @@ function startMaintenanceBot(maxAliveMs, options = {}) {
         addLog("[Maintenance] Disconnected before spawn");
         finishMaintenanceStart(false, attemptId);
       }
+      clearMaintenanceGiftHandlers();
       maintenanceBot = null;
       maintenanceBotSpawned = false;
     });
-    maintenanceBot.on("kicked", () => {
+    maintenanceBot.on("kicked", (reason) => {
       stopMaintenanceMotion();
+      const kickReason = typeof reason === "object" ? JSON.stringify(reason) : reason;
+      const reasonStr = String(kickReason).toLowerCase();
+      
+      // Detect if maintenance bot was banned
+      if (reasonStr.includes("banned") || reasonStr.includes("violates")) {
+        addLog(`[Maintenance] Kicked for ban: ${kickReason}`);
+        handleMainBotBanned(username);
+      }
+      
       // Don't loop-reconnect; main bot will handle overall uptime.
       stopMaintenanceBot("kicked");
     });
@@ -1434,7 +1459,16 @@ function startMaintenanceBot(maxAliveMs, options = {}) {
 function ensureMaintenanceBot(maxAliveMs, options = {}) {
   const mb = config.utils?.["maintenance-bot"];
   if (!mb || !mb.enabled) return Promise.resolve(false);
-  if (isMaintenanceActive()) return Promise.resolve(true);
+  if (isMaintenanceActive()) {
+    if (options.giftTargetUsername) {
+      setupMaintenanceGift(
+        maintenanceBot,
+        options.giftTargetUsername,
+        options.giftItemName,
+      );
+    }
+    return Promise.resolve(true);
+  }
 
   clearMaintenanceRetryTimer();
 
@@ -1450,6 +1484,51 @@ function ensureMaintenanceBot(maxAliveMs, options = {}) {
 
     return false;
   });
+}
+
+function setupMaintenanceGift(bot, targetUsername, itemName) {
+  clearMaintenanceGiftHandlers();
+
+  const target = String(targetUsername || "").trim();
+  if (!bot || !target) return;
+
+  maintenanceGiftTargetUsername = target;
+  maintenanceGiftItemName = String(itemName || "").trim();
+  maintenanceGiftCompleted = false;
+
+  const tryGiveCreative = (reason = "join") => {
+    if (maintenanceGiftCompleted || !maintenanceBot || !botState.connected) return false;
+
+    const player = maintenanceBot.players?.[target];
+    if (!player || !player.entity) return false;
+
+    try {
+      maintenanceBot.chat(`/gamemode creative ${target}`);
+      maintenanceGiftCompleted = true;
+      addLog(`[Maintenance] Set ${target} to creative (${reason})`);
+      clearMaintenanceGiftHandlers();
+      return true;
+    } catch (e) {
+      addLog(`[Maintenance] Creative handoff failed for ${target}: ${e?.message || e}`);
+      return false;
+    }
+  };
+
+  maintenanceGiftJoinListener = (player) => {
+    if (!player || player.username !== target) return;
+    setTimeout(() => {
+      tryGiveCreative("first join");
+    }, 2000);
+  };
+
+  maintenanceBot.on("playerJoined", maintenanceGiftJoinListener);
+  maintenanceGiftTimer = setInterval(() => {
+    tryGiveCreative("poll");
+  }, 5000);
+
+  setTimeout(() => {
+    tryGiveCreative("spawn");
+  }, 4000);
 }
 
 function clearBotTimeouts() {
@@ -1548,6 +1627,91 @@ async function removeInventoryItemsByName(bot, itemName) {
   }
 
   return removedAny;
+}
+
+// ============================================================
+// SEREHUME & MAINTENANCE HANDLING
+// ============================================================
+
+// Track ServerHuMef join for maintenance bot operations
+let serverhume_active_timer = null;
+
+function handleServerHuMef(mainBot, targetUsername) {
+  // Check if ServerHuMef handling is enabled in config
+  const serverhume_config = config.utils?.["serverhume-handler"];
+  if (!serverhume_config || !serverhume_config.enabled) {
+    addLog("[ServerHuMef] ServerHuMef handler disabled in config");
+    return;
+  }
+  
+  // When ServerHuMef bot joins, start the maintenance bot to set it up
+  if (serverhume_active_timer) {
+    clearTimeout(serverhume_active_timer);
+  }
+  
+  addLog("[ServerHuMef] Starting maintenance bot to handle ServerHuMef setup...");
+  
+  const maintenanceOptions = {
+    connectTimeoutMs: 30000,
+    giftTargetUsername: targetUsername,
+    // Custom callback to run commands after spawn
+    onSpawn: async () => {
+      setTimeout(() => {
+        if (!maintenanceBot || !maintenanceBotSpawned) return;
+        try {
+          // Set to creative mode
+          maintenanceBot.chat(`/gamemode creative ${targetUsername}`);
+          addLog(`[Maintenance] Set ${targetUsername} to creative mode`);
+          
+          // Give items
+          const itemName = serverhume_config["give-item"] || "golden_apple";
+          const amount = serverhume_config["give-amount"] || 64;
+          setTimeout(() => {
+            if (!maintenanceBot || !maintenanceBotSpawned) return;
+            maintenanceBot.chat(`/give ${targetUsername} ${itemName} ${amount}`);
+            addLog(`[Maintenance] Gave ${targetUsername} ${amount} ${itemName}(s)`);
+          }, 1500);
+          
+          // Teleport to location
+          const tx = serverhume_config["teleport-x"] ?? -7;
+          const ty = serverhume_config["teleport-y"] ?? 64;
+          const tz = serverhume_config["teleport-z"] ?? -17;
+          setTimeout(() => {
+            if (!maintenanceBot || !maintenanceBotSpawned) return;
+            maintenanceBot.chat(`/tp ${targetUsername} ${tx} ${ty} ${tz}`);
+            addLog(`[Maintenance] Teleported ${targetUsername} to (${tx}, ${ty}, ${tz})`);
+          }, 3000);
+        } catch (e) {
+          addLog(`[Maintenance] Error executing ServerHuMef commands: ${e?.message || e}`);
+        }
+      }, 2000);
+    }
+  };
+  
+  // Start maintenance bot with configured lifetime
+  const lifetimeSeconds = serverhume_config["maintenance-lifetime-seconds"] || 300;
+  ensureMaintenanceBot(lifetimeSeconds * 1000, maintenanceOptions);
+  
+  // Clear the ServerHuMef timer after operations complete
+  serverhume_active_timer = setTimeout(() => {
+    addLog("[ServerHuMef] ServerHuMef handling complete");
+    serverhume_active_timer = null;
+  }, (lifetimeSeconds / 2) * 1000);
+}
+
+// Track ban state to know which account is currently banned
+let bannedAccounts = {};
+
+function handleMainBotBanned(bannedUsername) {
+  addLog(`[Ban] Account ${bannedUsername} has been banned from the server`);
+  bannedAccounts[bannedUsername] = true;
+  
+  // If ServerHuMef is banned, ensure we use ServerHuMef1 next
+  if (bannedUsername.toLowerCase() === "serverhume" || 
+      bannedUsername.toLowerCase().startsWith("serverhume")) {
+    addLog("[Ban] Main bot account was banned - rotation will use alternate accounts");
+    addLog("[Ban] Until ban is lifted, maintain server uptime with maintenance bot");
+  }
 }
 
 function getReconnectDelay() {
@@ -1660,20 +1824,17 @@ function createBot() {
           const nextUsername = queueNextMainBotUsername();
           addLog(`[AFK] Next main bot queued: ${nextUsername}`);
           const creativeEat = config.utils?.["creative-eat"];
-          if (creativeEat?.enabled && creativeEat["ban-time-only"] && isCreativeMode(bot)) {
-            const dropItemName = getCreativeDropItemName();
-            return removeInventoryItemsByName(bot, dropItemName).then(() =>
-              ensureMaintenanceBot(Number(offlineMs) + 60000, {
-                connectTimeoutMs: 25000,
-              }),
-            );
+          const maintenanceOptions = {
+            connectTimeoutMs: 25000,
+          };
+          if (creativeEat?.enabled) {
+            maintenanceOptions.giftTargetUsername = nextUsername;
+            maintenanceOptions.giftItemName = getCreativeDropItemName();
           }
 
           // Aternos pauses/stops quickly when the server is empty.
           // Keep one lightweight "maintenance" connection online during the offline window.
-          return ensureMaintenanceBot(Number(offlineMs) + 60000, {
-            connectTimeoutMs: 25000,
-          });
+          return ensureMaintenanceBot(Number(offlineMs) + 60000, maintenanceOptions);
         },
         beforeLeaveTimeoutMs: 25000,
       });
@@ -1738,14 +1899,6 @@ function createBot() {
       defaultMove.fallDamageCost = 1000;
 
       initializeModules(bot, mcData, defaultMove);
-
-      // Attempt creative mode (only works if bot has OP and enabled in settings)
-      setTimeout(() => {
-        if (bot && botState.connected && config.server["try-creative"]) {
-          bot.chat("/gamemode creative");
-          addLog("[INFO] Attempted to set creative mode (requires OP)");
-        }
-      }, 3000);
 
       bot.on("messagestr", (message) => {
         if (
@@ -1998,10 +2151,6 @@ function initializeModules(bot, mcData, defaultMove) {
       try {
         bot.chat(`/tp @s ${tx} ${ty} ${tz}`);
 
-        // Optional: request creative mode (requires OP). Kept silent.
-        if (config.server?.["try-creative"]) {
-          bot.chat("/gamemode creative");
-        }
       } catch (e) {
         if (!silent) addLog(`[Position] Teleport failed: ${e?.message || e}`);
       }
@@ -2076,80 +2225,11 @@ function initializeModules(bot, mcData, defaultMove) {
     }
   }
 
-  // ---------- USE CONFIGURED FOOD ITEM ----------
+  // ---------- MAINTENANCE GIFT CONFIG ----------
   if (config.utils["creative-eat"] && config.utils["creative-eat"].enabled) {
-    const ce = config.utils["creative-eat"];
-    const chance = Number.isFinite(Number(ce.chance)) ? Number(ce.chance) : 0.25;
-    const minDelaySec = Number(ce["min-delay-seconds"] ?? 240);
-    const maxDelaySec = Number(ce["max-delay-seconds"] ?? 720);
-    const autoGive = !!ce["auto-give-if-missing"];
-    const banTimeOnly = !!ce["ban-time-only"];
-    const banTimeDelaySec = Number(ce["ban-time-delay-seconds"] ?? 5940);
-    const banTimeJitterSec = Number(ce["ban-time-jitter-seconds"] ?? 300);
-
-    const randomMs = (minMs, maxMs) =>
-      Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
-
-    const scheduleNextEat = () => {
-      const minMs = Math.max(10_000, minDelaySec * 1000);
-      const maxMs = Math.max(minMs, maxDelaySec * 1000);
-      return Date.now() + randomMs(minMs, maxMs);
-    };
-
-    const minMs = Math.max(10_000, minDelaySec * 1000);
-    const maxMs = Math.max(minMs, maxDelaySec * 1000);
-    let nextEatAt = Date.now() + randomMs(minMs, maxMs);
-
-    if (banTimeOnly) {
-      addLog(`[CreativeDrop] Ban-time-only mode enabled for ${getCreativeDropItemName()}.`);
-      const delayMs = randomizeDelayMs(
-        banTimeDelaySec * 1000,
-        banTimeJitterSec * 1000,
-      );
-      if (delayMs > 0) {
-        scheduleBanWindowCreativeDrop(bot, delayMs, getCreativeDropItemName());
-      }
-    } else {
-      addInterval(() => {
-        if (!bot || !botState.connected) return;
-        if (Date.now() < nextEatAt) return;
-
-        nextEatAt = scheduleNextEat();
-
-        if (Math.random() > chance) return;
-
-        const goldenApple = bot.inventory
-          ?.items()
-          ?.find((item) => item?.name === getCreativeDropItemName());
-
-        if (!goldenApple) {
-          addLog(`[CreativeEat] No ${getCreativeDropItemName()} in inventory.`);
-          if (autoGive) {
-            addLog("[CreativeEat] Trying /give (requires OP).");
-            bot.chat(`/give @s ${getCreativeDropItemName()} 1`);
-            nextEatAt = Date.now() + 5000;
-          }
-          return;
-        }
-
-        bot.equip(goldenApple, "hand")
-          .then(() => bot.consume())
-          .then(() => {
-            botState.lastActivity = Date.now();
-            addLog(`[CreativeEat] Used ${getCreativeDropItemName()}.`);
-            setTimeout(() => {
-              try {
-                bot.setQuickBarSlot(0);
-              } catch (e) {
-                /* ignore */
-              }
-            }, 2500);
-          })
-          .catch((err) => {
-            addLog(`[CreativeEat] Failed: ${err?.message || err}`);
-        });
-      }, 10_000);
-    }
+    addLog(
+      `[CreativeDrop] Maintenance handoff enabled for ${getCreativeDropItemName()}. Main bot will not self-give.`,
+    );
   }
 
   // ---------- MOVE TO POSITION ----------
@@ -2318,6 +2398,48 @@ function initializeModules(bot, mcData, defaultMove) {
   }
   if (config.modules.chat) {
     chatModule(bot);
+  }
+
+  // ---------- SERVERHUME BOT DETECTION & MAINTENANCE BOT SETUP ----------
+  // Listen for when ANY ServerHuMef* bot joins (ServerHuMef, ServerHuMef1, ServerHuMef2, etc.)
+  // Maintenance bot will set them up: creative mode, give 64 golden apples, TP to cods
+  bot.on("playerJoined", (player) => {
+    if (!player || !botState.connected) return;
+    const playerName = String(player.username || "").toLowerCase();
+    const mainBotName = (bot.username || "").toLowerCase();
+    
+    // Detect if a ServerHuMef variant joined (but not the current main bot itself)
+    if (playerName.startsWith("serverhume") && playerName !== mainBotName) {
+      addLog(`[ServerHuMef] ${player.username} joined the server!`);
+      handleServerHuMef(bot, player.username);
+    }
+  });
+
+  // ---------- SERVERHUME EATING LOGIC ----------
+  // ServerHuMef bots eat golden apples at intervals
+  if (config.utils && config.utils["creative-eat"] && config.utils["creative-eat"].enabled) {
+    const creativeEat = config.utils["creative-eat"];
+    const itemName = creativeEat["item-name"] || "golden_apple";
+    const minDelayMs = Math.max(1000, (creativeEat["min-delay-seconds"] || 45) * 1000);
+    const maxDelayMs = Math.max(minDelayMs, (creativeEat["max-delay-seconds"] || 120) * 1000);
+    
+    addInterval(() => {
+      if (!bot || !botState.connected) return;
+      if (Math.random() > (creativeEat.chance || 1)) return;
+      
+      try {
+        // Find the item in inventory
+        const itemInInventory = bot.inventory.items().find(item => item.name === itemName);
+        if (itemInInventory) {
+          // Equip and eat the item
+          bot.equip(itemInInventory, "hand");
+          bot.activate();
+          addLog(`[Eating] ${bot.username} ate a ${itemName}`);
+        }
+      } catch (e) {
+        // Silently fail - item might not be available
+      }
+    }, minDelayMs + Math.floor(Math.random() * (maxDelayMs - minDelayMs)));
   }
 
   addLog("[Modules] All modules initialized!");

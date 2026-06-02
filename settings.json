@@ -8,8 +8,7 @@
   "server": {
     "ip": "jaldisejoin.aternos.me",
     "port": 21744,
-    "version": "",
-    "try-creative": false
+    "version": ""
   },
   "position": {
     "enabled": true,
@@ -64,6 +63,15 @@
     "maintenance-bot": {
       "enabled": true,
       "username": "Maintenance"
+    },
+    "serverhume-handler": {
+      "enabled": true,
+      "give-item": "golden_apple",
+      "give-amount": 64,
+      "teleport-x": -7,
+      "teleport-y": 64,
+      "teleport-z": -17,
+      "maintenance-lifetime-seconds": 300
     }
   },
   "movement": {
