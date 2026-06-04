@@ -1390,8 +1390,13 @@ function startMaintenanceBot(maxAliveMs, options = {}) {
       finishMaintenanceStart(true, attemptId);
     });
 
+    // Guard to prevent duplicate disconnect handling
+    let maintenanceStopping = false;
+
     maintenanceBot.on("end", () => {
       if (attemptId !== maintenanceAttemptId || maintenanceBot !== currentMaintenanceBot) return;
+      if (maintenanceStopping) return;
+      maintenanceStopping = true;
       stopMaintenanceMotion();
       if (!spawned) {
         addLog("[Maintenance] Disconnected before spawn");
@@ -1400,20 +1405,31 @@ function startMaintenanceBot(maxAliveMs, options = {}) {
       clearMaintenanceGiftHandlers();
       maintenanceBot = null;
       maintenanceBotSpawned = false;
+      // allow future attempts after brief cooldown
+      setTimeout(() => (maintenanceStopping = false), 1000);
     });
+
     maintenanceBot.on("kicked", (reason) => {
+      if (attemptId !== maintenanceAttemptId || maintenanceBot !== currentMaintenanceBot) return;
+      if (maintenanceStopping) return;
+      maintenanceStopping = true;
       stopMaintenanceMotion();
       const kickReason = typeof reason === "object" ? JSON.stringify(reason) : reason;
       const reasonStr = String(kickReason).toLowerCase();
-      
+
       // Detect if maintenance bot was banned
       if (reasonStr.includes("banned") || reasonStr.includes("violates")) {
         addLog(`[Maintenance] Kicked for ban: ${kickReason}`);
         handleMainBotBanned(username);
       }
-      
+
       // Don't loop-reconnect; main bot will handle overall uptime.
-      stopMaintenanceBot("kicked");
+      try {
+        stopMaintenanceBot("kicked");
+      } catch (e) {
+        /* ignore */
+      }
+      setTimeout(() => (maintenanceStopping = false), 1000);
     });
     maintenanceBot.on("error", () => {
       stopMaintenanceMotion();
