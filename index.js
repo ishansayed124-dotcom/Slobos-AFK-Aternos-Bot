@@ -1420,7 +1420,12 @@ function startMaintenanceBot(maxAliveMs, options = {}) {
       // Detect if maintenance bot was banned
       if (reasonStr.includes("banned") || reasonStr.includes("violates")) {
         addLog(`[Maintenance] Kicked for ban: ${kickReason}`);
-        handleMainBotBanned(username);
+        // Record the ban and ensure a maintenance connection is present
+        try {
+          handleMainBotBannedAndEnsureMaintenance(username);
+        } catch (e) {
+          addLog(`[Maintenance] Error handling ban: ${e?.message || e}`);
+        }
       }
 
       // Don't loop-reconnect; main bot will handle overall uptime.
@@ -1730,6 +1735,30 @@ function handleMainBotBanned(bannedUsername) {
   }
 }
 
+// Start a maintenance connection when a primary account is banned so the server
+// doesn't shut down due to being empty. This keeps the server alive while the
+// ban is active and allows alternate main bot usernames to be prepared.
+function handleMainBotBannedAndEnsureMaintenance(bannedUsername) {
+  try {
+    handleMainBotBanned(bannedUsername);
+  } catch (e) {
+    addLog(`[Ban] Error handling ban bookkeeping: ${e?.message || e}`);
+  }
+
+  // Try to start the maintenance bot for a reasonable window (10 minutes)
+  // if maintenance is enabled in config. This is best-effort and will be
+  // skipped if maintenance is already active.
+  try {
+    const maintenanceLifetimeMs = 10 * 60 * 1000; // 10 minutes
+    addLog(`[Ban] Ensuring maintenance bot is active for ${maintenanceLifetimeMs / 1000}s`);
+    ensureMaintenanceBot(maintenanceLifetimeMs, {}).catch((err) => {
+      addLog(`[Ban] Failed to ensure maintenance bot: ${err?.message || err}`);
+    });
+  } catch (e) {
+    addLog(`[Ban] Error starting maintenance bot: ${e?.message || e}`);
+  }
+}
+
 function getReconnectDelay() {
   if (botState.forcedReconnectDelayMs != null) {
     const forced = Math.max(0, Number(botState.forcedReconnectDelayMs));
@@ -2003,6 +2032,12 @@ function createBot() {
         botState.reconnectBlockedReason = kickReason;
         botRunning = false;
         addLog("[Bot] Reconnect disabled because the account is banned.");
+        // Start/ensure maintenance bot so the server remains online while ban is active
+        try {
+          handleMainBotBannedAndEnsureMaintenance(kickReason);
+        } catch (e) {
+          addLog(`[Ban] Error while ensuring maintenance: ${e?.message || e}`);
+        }
       }
 
       if (
