@@ -1376,7 +1376,32 @@ function startMaintenanceBot(maxAliveMs, options = {}) {
       if (attemptId !== maintenanceAttemptId || maintenanceBot !== currentMaintenanceBot) return;
       spawned = true;
       maintenanceBotSpawned = true;
-      startMaintenanceMotionCycle();
+      // If the server appears empty (no players besides this maintenance bot),
+      // perform a brief forward->back movement to avoid idle detection.
+      try {
+        const players = maintenanceBot.players || {};
+        const otherPlayers = Object.keys(players).filter((p) => p !== (maintenanceBot.username || "")).filter(Boolean);
+        if (otherPlayers.length === 0) {
+          try {
+            maintenanceBot.setControlState?.("forward", true);
+            setTimeout(() => {
+              try {
+                maintenanceBot.setControlState?.("forward", false);
+                maintenanceBot.setControlState?.("back", true);
+                setTimeout(() => {
+                  try {
+                    maintenanceBot.setControlState?.("back", false);
+                  } catch (_) {}
+                }, 600);
+              } catch (_) {}
+            }, 800);
+          } catch (e) {
+            /* ignore */
+          }
+        }
+      } catch (e) {
+        /* ignore */
+      }
       if (options.giftTargetUsername) {
         setupMaintenanceGift(currentMaintenanceBot, options.giftTargetUsername, options.giftItemName);
       }
