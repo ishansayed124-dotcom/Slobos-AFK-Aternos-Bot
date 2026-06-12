@@ -1174,6 +1174,10 @@ setInterval(
 // RECONNECTION & TIMEOUT MANAGEMENT
 // ============================================================
 let bot = null;
+let replacementBot = null;
+let replacementAttemptId = 0;
+let replacementConnectionTimeoutId = null;
+let replacementSpawnHandled = false;
 let maintenanceBot = null;
 let maintenanceBotSpawned = false;
 let maintenanceStopTimer = null;
@@ -1194,6 +1198,7 @@ let maintenanceMotionTimers = {
 let activeIntervals = [];
 let reconnectTimeoutId = null;
 let connectionTimeoutId = null;
+let replacementTimeoutId = null;
 let isReconnecting = false;
 let activeConnectionAttemptId = 0;
 
@@ -1588,6 +1593,169 @@ function clearBotTimeouts() {
   }
 }
 
+function clearReplacementTimeouts() {
+  if (replacementTimeoutId) {
+    clearTimeout(replacementTimeoutId);
+    replacementTimeoutId = null;
+  }
+}
+
+function stopReplacementBot(reason = "replacement aborted") {
+  clearReplacementTimeouts();
+  if (!replacementBot) return;
+  try {
+    addLog(`[Bot] Stopping replacement bot (${reason})`);
+    replacementBot.removeAllListeners();
+    replacementBot.end();
+  } catch (e) {
+    /* ignore */
+  } finally {
+    replacementBot = null;
+    replacementSpawnHandled = false;
+  }
+}
+
+async function createReplacementBot() {
+  if (!bot) {
+    addLog('[Bot] Replacement failed: no active main bot');
+    return false;
+  }
+  if (replacementBot) {
+    addLog('[Bot] Replacement already in progress');
+    return false;
+  }
+
+  const oldBot = bot;
+  const { generation, username } = consumeMainBotUsername();
+  addLog(`[Bot] Starting replacement bot as ${username} (cycle ${generation})`);
+
+  try {
+    const thisReplacementAttemptId = ++replacementAttemptId;
+    const botVersion =
+      config.server.version && config.server.version.trim() !== ""
+        ? config.server.version
+        : false;
+
+    replacementBot = mineflayer.createBot({
+      username,
+      password: config["bot-account"].password || undefined,
+      auth: config["bot-account"].type,
+      host: config.server.ip,
+      port: config.server.port,
+      version: botVersion,
+      hideErrors: true,
+      checkTimeoutInterval: 600000,
+    });
+
+    replacementBot.loadPlugin(pathfinder);
+    const currentReplacementBot = replacementBot;
+    let spawned = false;
+    let resolved = false;
+
+    const cleanupReplacement = () => {
+      clearReplacementTimeouts();
+      if (replacementBot === currentReplacementBot) {
+        replacementBot = null;
+      }
+    };
+
+    return new Promise((resolve) => {
+      const finalizeFailure = (reason) => {
+        if (resolved) return;
+        resolved = true;
+        addLog(`[Bot] Replacement bot failed: ${reason}`);
+        cleanupReplacement();
+        resolve(false);
+      };
+
+      replacementBot.once("spawn", () => {
+        if (thisReplacementAttemptId !== replacementAttemptId || replacementBot !== currentReplacementBot) return;
+        spawned = true;
+        replacementSpawnHandled = true;
+        clearReplacementTimeouts();
+
+        addLog(`[Bot] Replacement bot spawned as ${username}`);
+
+        try {
+          clearAllIntervals();
+        } catch (e) {
+          /* ignore */
+        }
+
+        try {
+          bot = currentReplacementBot;
+          botState.connected = true;
+          botState.lastActivity = Date.now();
+          botState.reconnectAttempts = 0;
+          isReconnecting = false;
+          commitMainBotUsernameGeneration();
+          stopMaintenanceBot("replacement bot connected");
+
+          const mcData = require("minecraft-data")(bot.version);
+          const defaultMove = new Movements(bot, mcData);
+          defaultMove.allowFreeMotion = false;
+          defaultMove.canDig = false;
+          defaultMove.liquidCost = 1000;
+          defaultMove.fallDamageCost = 1000;
+
+          initializeModules(bot, mcData, defaultMove);
+
+          bot.on("messagestr", (message) => {
+            if (
+              message.includes("commands.gamemode.success.self") ||
+              message.includes("Set own game mode to Creative Mode")
+            ) {
+              addLog("[INFO] Bot is now in Creative Mode.");
+            }
+          });
+        } catch (e) {
+          addLog(`[Bot] Replacement initialization error: ${e?.message || e}`);
+        }
+
+        try {
+          oldBot.removeAllListeners();
+          oldBot.end();
+        } catch (e) {
+          /* ignore */
+        }
+
+        resolved = true;
+        cleanupReplacement();
+        resolve(true);
+      });
+
+      replacementBot.on("end", (reason) => {
+        if (thisReplacementAttemptId !== replacementAttemptId || replacementBot !== currentReplacementBot) return;
+        if (resolved) return;
+        finalizeFailure(reason || "disconnected before spawn");
+      });
+
+      replacementBot.on("kicked", (reason) => {
+        if (thisReplacementAttemptId !== replacementAttemptId || replacementBot !== currentReplacementBot) return;
+        if (resolved) return;
+        const kickReason = typeof reason === "object" ? JSON.stringify(reason) : reason;
+        finalizeFailure(kickReason || "kicked before spawn");
+      });
+
+      replacementBot.on("error", (err) => {
+        if (thisReplacementAttemptId !== replacementAttemptId || replacementBot !== currentReplacementBot) return;
+        if (resolved) return;
+        finalizeFailure(err?.message || "error before spawn");
+      });
+
+      replacementTimeoutId = setTimeout(() => {
+        if (resolved) return;
+        finalizeFailure("spawn timeout");
+      }, 150000);
+    });
+  } catch (e) {
+    addLog(`[Bot] Replacement failed to create: ${e?.message || e}`);
+    replacementBot = null;
+    replacementSpawnHandled = false;
+    return false;
+  }
+}
+
 // FIX: Discord rate limiting - track last send time
 let lastDiscordSend = 0;
 const DISCORD_RATE_LIMIT_MS = 5000; // min 5s between webhook calls
@@ -1747,15 +1915,36 @@ function handleServerHuMef(mainBot, targetUsername) {
 
 // Track ban state to know which account is currently banned
 let bannedAccounts = {};
+const mainBotUsernameRootLower = mainBotUsernameRoot.toLowerCase();
+
+function isMainBotUsername(username) {
+  if (!username) return false;
+  const lower = String(username).toLowerCase();
+  if (lower === mainBotUsernameRootLower) return true;
+  if (!lower.startsWith(mainBotUsernameRootLower)) return false;
+  const suffix = lower.slice(mainBotUsernameRootLower.length);
+  return suffix === "" || /^\d+$/.test(suffix);
+}
+
+function queueNextMainBotForBan(bannedUsername) {
+  if (!shouldRotateMainBotUsername()) return null;
+  if (!isMainBotUsername(bannedUsername)) return null;
+  const nextUsername = queueNextMainBotUsername();
+  addLog(`[Ban] Queued next main bot username: ${nextUsername}`);
+  return nextUsername;
+}
 
 function handleMainBotBanned(bannedUsername) {
   addLog(`[Ban] Account ${bannedUsername} has been banned from the server`);
   bannedAccounts[bannedUsername] = true;
   
-  // If ServerHuMef is banned, ensure we use ServerHuMef1 next
-  if (bannedUsername.toLowerCase() === "serverhume" || 
-      bannedUsername.toLowerCase().startsWith("serverhume")) {
+  const nextUsername = queueNextMainBotForBan(bannedUsername);
+
+  if (isMainBotUsername(bannedUsername)) {
     addLog("[Ban] Main bot account was banned - rotation will use alternate accounts");
+    if (nextUsername) {
+      addLog(`[Ban] Next main bot will attempt to connect as ${nextUsername}`);
+    }
     addLog("[Ban] Until ban is lifted, maintain server uptime with maintenance bot");
   }
 }
@@ -1890,21 +2079,37 @@ function createBot() {
         setNextReconnectDelayMs: (ms) => {
           botState.forcedReconnectDelayMs = ms;
         },
-        onBeforeLeave: ({ offlineMs }) => {
-          const nextUsername = queueNextMainBotUsername();
-          addLog(`[AFK] Next main bot queued: ${nextUsername}`);
+        onBeforeLeave: async ({ offlineMs }) => {
+          let nextUsername = null;
+          if (shouldRotateMainBotUsername()) {
+            nextUsername = queueNextMainBotUsername();
+            addLog(`[AFK] Next main bot queued: ${nextUsername}`);
+          }
+
           const creativeEat = config.utils?.["creative-eat"];
           const maintenanceOptions = {
             connectTimeoutMs: 25000,
           };
-          if (creativeEat?.enabled) {
+          if (creativeEat?.enabled && nextUsername) {
             maintenanceOptions.giftTargetUsername = nextUsername;
             maintenanceOptions.giftItemName = getCreativeDropItemName();
           }
 
+          const maintenancePromise = ensureMaintenanceBot(Number(offlineMs) + 60000, maintenanceOptions);
+
+          if (nextUsername) {
+            const replaced = await createReplacementBot();
+            if (replaced) {
+              addLog(`[AFK] Replacement bot for ${nextUsername} is in progress`);
+              await maintenancePromise;
+              return { skipLeave: true };
+            }
+            addLog('[AFK] Replacement bot failed, continuing with normal leave');
+          }
+
           // Aternos pauses/stops quickly when the server is empty.
           // Keep one lightweight "maintenance" connection online during the offline window.
-          return ensureMaintenanceBot(Number(offlineMs) + 60000, maintenanceOptions);
+          return maintenancePromise;
         },
         beforeLeaveTimeoutMs: 25000,
       });
@@ -2054,9 +2259,18 @@ function createBot() {
         reasonStr.includes("banned from this server") ||
         reasonStr.includes("violates our terms of service")
       ) {
-        botState.reconnectBlockedReason = kickReason;
-        botRunning = false;
-        addLog("[Bot] Reconnect disabled because the account is banned.");
+        const nextUsername = queueNextMainBotForBan(bot?.username || kickReason);
+        if (nextUsername) {
+          botState.reconnectBlockedReason = null;
+          botRunning = true;
+          botState.forcedReconnectDelayMs = 0;
+          addLog(`[Bot] Ban detected on main account. Reconnecting immediately as ${nextUsername}`);
+        } else {
+          botState.reconnectBlockedReason = kickReason;
+          botRunning = false;
+          addLog("[Bot] Reconnect disabled because the account is banned.");
+        }
+
         // Start/ensure maintenance bot so the server remains online while ban is active
         try {
           handleMainBotBannedAndEnsureMaintenance(kickReason);

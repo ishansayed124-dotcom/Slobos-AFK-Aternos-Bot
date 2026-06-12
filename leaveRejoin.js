@@ -96,6 +96,9 @@ function setupLeaveRejoin(bot, options = {}) {
                             logThrottled(`[AFK] Retrying leave in ${Math.round(retryMs / 1000)} seconds`)
                             scheduleLeaveIn(retryMs)
                             return
+                        } else if (r && typeof r === 'object' && r.skipLeave) {
+                            logThrottled('[AFK] Leave skipped because replacement handoff is active')
+                            return
                         }
                     }
                 } catch (e) {
